@@ -20,17 +20,35 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'npm'
+
+      - name: Locate project directory
+        id: locate
+        run: |
+          echo "Inspecting repository contents:"
+          ls -la
+          PKG_PATH=$(find . -name "package.json" -not -path "*/node_modules/*" | head -n 1)
+          if [ -n "$PKG_PATH" ]; then
+            PROJECT_DIR=$(dirname "$PKG_PATH")
+            echo "Found package.json in directory: $PROJECT_DIR"
+            echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          else
+            echo "ERROR: package.json was not found anywhere in the repository."
+            echo "Listing full directory contents:"
+            find . -maxdepth 3
+            exit 1
+          fi
 
       - name: Install dependencies
+        working-directory: ${{ steps.locate.outputs.project_dir }}
         run: npm install --legacy-peer-deps
 
       - name: Build artifact
+        working-directory: ${{ steps.locate.outputs.project_dir }}
         run: npm run build
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-build-artifact
-          path: dist/
+          path: ${{ steps.locate.outputs.project_dir }}/dist/
           retention-days: 14
