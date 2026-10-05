@@ -12,9 +12,27 @@ export default function App() {
   // Settings states
   const [cameraOn, setCameraOn] = useState(true);
   const [recorderOn, setRecorderOn] = useState(true);
-  const [provider, setProvider] = useState<'localhost' | 'server'>('localhost');
-  const [hostInput, setHostInput] = useState('http://localhost:8000');
-  const [endpointInput, setEndpointInput] = useState('https://api.server.com');
+  const [provider, setProvider] = useState<'localhost' | 'server'>(() => {
+    try {
+      return (localStorage.getItem('streamer_provider') as 'localhost' | 'server') || 'localhost';
+    } catch {
+      return 'localhost';
+    }
+  });
+  const [hostInput, setHostInput] = useState(() => {
+    try {
+      return localStorage.getItem('streamer_host') || 'http://localhost:8000';
+    } catch {
+      return 'http://localhost:8000';
+    }
+  });
+  const [endpointInput, setEndpointInput] = useState(() => {
+    try {
+      return localStorage.getItem('streamer_endpoint') || 'https://api.server.com';
+    } catch {
+      return 'https://api.server.com';
+    }
+  });
 
   // Streaming refs
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -25,6 +43,23 @@ export default function App() {
   const nextPlayTimeRef = useRef<number>(0);
   const isSendingFrameRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Incoming Opus streaming refs
+  const mediaSourceRef = useRef<MediaSource | null>(null);
+  const sourceBufferRef = useRef<SourceBuffer | null>(null);
+  const audioElemRef = useRef<HTMLAudioElement | null>(null);
+  const chunkQueueRef = useRef<Uint8Array[]>([]);
+
+  // Connection check state (for settings modal)
+  const [connectionCheck, setConnectionCheck] = useState<{
+    status: 'idle' | 'checking' | 'success' | 'error';
+    message: string | null;
+    pingMs: number | null;
+  }>({
+    status: 'idle',
+    message: null,
+    pingMs: null,
+  });
 
   // Network and streaming activity status
   const [netState, setNetState] = useState<{
@@ -48,7 +83,61 @@ export default function App() {
     return base.replace(/\/+$/, '');
   }, [provider, hostInput, endpointInput]);
 
-  // Audio queue playback
+  // Save settings and test connection
+  const handleSaveAndCheckConnection = useCallback(async () => {
+    try {
+      localStorage.setItem('streamer_provider', provider);
+      localStorage.setItem('streamer_host', hostInput);
+      localStorage.setItem('streamer_endpoint', endpointInput);
+    } catch {
+      // Ignore storage errors
+    }
+
+    const targetUrl = getBaseUrl();
+    setConnectionCheck({ status: 'checking', message: `Checking ${targetUrl}...`, pingMs: null });
+
+    const startTime = performance.now();
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4000);
+
+      const res = await fetch(`${targetUrl}/v1/audio/sent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ping: true }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const pingMs = Math.round(performance.now() - startTime);
+
+      if (res.status === 200 || res.status === 400) {
+        setConnectionCheck({
+          status: 'success',
+          message: `Connected successfully! (HTTP ${res.status})`,
+          pingMs,
+        });
+      } else {
+        setConnectionCheck({
+          status: 'error',
+          message: `Server reachable but returned HTTP ${res.status} (${res.statusText})`,
+          pingMs,
+        });
+      }
+    } catch (err: unknown) {
+      const msg = (err as Error)?.message || 'Connection failed';
+      setConnectionCheck({
+        status: 'error',
+        message: msg.includes('abort')
+          ? 'Timed out (4s). Check IP & firewall on port 8000.'
+          : msg.includes('Failed to fetch')
+          ? 'Failed to fetch. Server not running, wrong IP, or CORS missing.'
+          : msg,
+        pingMs: null,
+      });
+    }
+  }, [provider, hostInput, endpointInput, getBaseUrl]);
+
+  // Web Audio fallback player for individual chunks
   const playAudioChunk = useCallback(async (arrayBuffer: ArrayBuffer) => {
     if (!audioContextRef.current) {
       const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -70,11 +159,30 @@ export default function App() {
       source.start(startTime);
       nextPlayTimeRef.current = startTime + audioBuffer.duration;
     } catch {
-      // Ignore individual corrupted packet decode errors
+      // Ignore individual decode errors
     }
   }, []);
 
-  // Listen to /v2/audio/retrived
+  // Stop incoming audio player cleanly
+  const stopAudioPlayer = useCallback(() => {
+    if (audioElemRef.current) {
+      audioElemRef.current.pause();
+      audioElemRef.current.removeAttribute('src');
+      audioElemRef.current.load();
+      audioElemRef.current = null;
+    }
+    sourceBufferRef.current = null;
+    mediaSourceRef.current = null;
+    chunkQueueRef.current = [];
+
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    nextPlayTimeRef.current = 0;
+  }, []);
+
+  // Listen to /v2/audio/retrived and play Opus stream in real-time queue
   const startAudioReceiver = useCallback((baseUrl: string, signal: AbortSignal) => {
     const listenEndpoint = `${baseUrl}/v2/audio/retrived`;
 
@@ -87,13 +195,83 @@ export default function App() {
           return;
         }
 
-        console.log('[Audio Receiver] Stream connected, reading chunks...');
+        console.log('[Audio Receiver] Stream connected, preparing Opus playback queue...');
+
+        // Setup MediaSource for streaming WebM/Ogg Opus if supported
+        const supportedType = typeof MediaSource !== 'undefined' && [
+          'audio/webm; codecs="opus"',
+          'audio/ogg; codecs="opus"',
+          'audio/webm',
+        ].find((type) => MediaSource.isTypeSupported(type));
+
+        let useMediaSource = false;
+        if (supportedType) {
+          try {
+            const ms = new MediaSource();
+            const audio = new Audio();
+            audio.src = URL.createObjectURL(ms);
+            audioElemRef.current = audio;
+            mediaSourceRef.current = ms;
+
+            await new Promise<void>((resolve) => {
+              const onOpen = () => {
+                ms.removeEventListener('sourceopen', onOpen);
+                try {
+                  const sb = ms.addSourceBuffer(supportedType);
+                  sb.mode = 'sequence';
+                  sourceBufferRef.current = sb;
+
+                  sb.addEventListener('updateend', () => {
+                    if (chunkQueueRef.current.length > 0 && !sb.updating) {
+                      const next = chunkQueueRef.current.shift();
+                      if (next) {
+                        try {
+                          sb.appendBuffer(next);
+                        } catch {
+                          // ignore
+                        }
+                      }
+                    }
+                  });
+                  useMediaSource = true;
+                  audio.play().catch(() => {});
+                } catch (e) {
+                  console.warn('[Audio Receiver] SourceBuffer add error:', e);
+                }
+                resolve();
+              };
+              ms.addEventListener('sourceopen', onOpen);
+              setTimeout(resolve, 300); // timeout fallback to Web Audio
+            });
+          } catch (e) {
+            console.warn('[Audio Receiver] MediaSource fallback:', e);
+            useMediaSource = false;
+          }
+        }
+
         const reader = response.body.getReader();
         while (!signal.aborted) {
           const { done, value } = await reader.read();
           if (done) break;
           if (value && value.byteLength > 0) {
-            await playAudioChunk(value.buffer);
+            const sb = sourceBufferRef.current;
+            if (useMediaSource && sb) {
+              if (sb.updating || chunkQueueRef.current.length > 0) {
+                chunkQueueRef.current.push(value);
+              } else {
+                try {
+                  sb.appendBuffer(value);
+                } catch {
+                  chunkQueueRef.current.push(value);
+                }
+              }
+              if (audioElemRef.current && audioElemRef.current.paused) {
+                audioElemRef.current.play().catch(() => {});
+              }
+            } else {
+              // Web Audio API fallback for standalone chunks
+              await playAudioChunk(value.buffer);
+            }
           }
         }
       } catch (err: unknown) {
@@ -133,11 +311,7 @@ export default function App() {
       if (videoRef.current) {
         videoRef.current.srcObject = null;
       }
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close().catch(() => {});
-        audioContextRef.current = null;
-      }
-      nextPlayTimeRef.current = 0;
+      stopAudioPlayer();
       return;
     }
 
@@ -328,8 +502,9 @@ export default function App() {
     return () => {
       if (frameInterval) clearInterval(frameInterval);
       abortController.abort();
+      stopAudioPlayer();
     };
-  }, [inCall, getBaseUrl, cameraOn, recorderOn, startAudioReceiver]);
+  }, [inCall, getBaseUrl, cameraOn, recorderOn, startAudioReceiver, stopAudioPlayer]);
 
   // Handle cameraOn toggle on live stream
   useEffect(() => {
@@ -358,28 +533,6 @@ export default function App() {
       <div className="h-[83%] w-full bg-black rounded-b-[40px] sm:rounded-b-[48px] shadow-[0_16px_36px_rgba(0,0,0,0.22)] relative z-10 overflow-hidden flex items-center justify-center">
         {/* Hidden canvas for 15fps WebP image capture */}
         <canvas ref={canvasRef} className="hidden" />
-
-        {/* Live streaming status badge on top left */}
-        {inCall && (
-          <div className="absolute top-4 left-4 sm:top-5 sm:left-5 z-20 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-neutral-900/85 border border-white/10 backdrop-blur-xs text-xs font-mono select-none pointer-events-none">
-            <span
-              className={`w-2.5 h-2.5 rounded-full ${
-                netState.status === 'ok'
-                  ? 'bg-emerald-400 animate-pulse'
-                  : netState.status === 'error'
-                  ? 'bg-rose-500'
-                  : 'bg-amber-400 animate-pulse'
-              }`}
-            />
-            <span className="text-neutral-200">
-              {netState.status === 'ok'
-                ? `Live • ${netState.imgCount}f • ${netState.audioCount}a`
-                : netState.status === 'error'
-                ? (netState.lastError || 'Disconnected')
-                : 'Connecting...'}
-            </span>
-          </div>
-        )}
 
         {/* Live camera stream */}
         {inCall && cameraOn ? (
@@ -427,7 +580,7 @@ export default function App() {
           onClick={() => setIsSettingsOpen(false)}
         >
           <div
-            className="w-[88%] max-w-sm sm:max-w-md bg-neutral-900 border border-neutral-800 rounded-3xl p-6 shadow-2xl flex flex-col gap-5 text-white relative"
+            className="w-[88%] max-w-sm sm:max-w-md bg-neutral-900 border border-neutral-800 rounded-3xl p-6 shadow-2xl flex flex-col gap-4 text-white relative max-h-[88vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Exit button */}
@@ -552,6 +705,76 @@ export default function App() {
                   placeholder="https://api.server.com/endpoint"
                   className="w-full mt-1 px-3.5 py-2.5 rounded-xl bg-neutral-900 border border-neutral-700 text-sm text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-[#E57373] transition-all"
                 />
+              )}
+            </div>
+
+            {/* Save & Check Connection Button & Status */}
+            <div className="flex flex-col gap-2.5 pt-1">
+              <button
+                type="button"
+                onClick={handleSaveAndCheckConnection}
+                disabled={connectionCheck.status === 'checking'}
+                className="w-full py-3 px-4 rounded-2xl bg-[#E57373] hover:bg-[#e06666] active:scale-[0.98] disabled:opacity-60 text-white font-medium text-sm transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer outline-none"
+              >
+                {connectionCheck.status === 'checking' ? (
+                  <>
+                    <svg className="animate-spin h-4 w-4 text-white" viewBox="0 0 24 24" fill="none">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                    </svg>
+                    <span>Checking Connection...</span>
+                  </>
+                ) : (
+                  <>
+                    <svg xmlns="http://www.w3.org/2000/svg" height="18px" viewBox="0 -960 960 960" width="18px" fill="currentColor">
+                      <path d="M840-680v480q0 33-23.5 56.5T760-120H200q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h480l160 160Zm-80 34L646-760H200v560h560v-446ZM480-240q50 0 85-35t35-85q0-50-35-85t-85-35q-50 0-85 35t-35 85q0 50 35 85t85 35ZM240-560h360v-160H240v160Zm-40-86v446-560 114Z" />
+                    </svg>
+                    <span>Save &amp; Check Connection</span>
+                  </>
+                )}
+              </button>
+
+              {/* Result Panel */}
+              {connectionCheck.status !== 'idle' && (
+                <div
+                  className={`p-3.5 rounded-2xl border text-xs leading-relaxed flex flex-col gap-1.5 transition-all ${
+                    connectionCheck.status === 'success'
+                      ? 'bg-emerald-950/40 border-emerald-500/40 text-emerald-200'
+                      : connectionCheck.status === 'error'
+                      ? 'bg-rose-950/40 border-rose-500/40 text-rose-200'
+                      : 'bg-neutral-800/60 border-neutral-700/50 text-neutral-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-semibold">
+                    {connectionCheck.status === 'success' && (
+                      <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                    )}
+                    {connectionCheck.status === 'error' && (
+                      <span className="w-2 h-2 rounded-full bg-rose-500" />
+                    )}
+                    {connectionCheck.status === 'checking' && (
+                      <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+                    )}
+                    <span>
+                      {connectionCheck.status === 'success'
+                        ? `Server Connected ${connectionCheck.pingMs ? `(${connectionCheck.pingMs}ms)` : ''}`
+                        : connectionCheck.status === 'error'
+                        ? 'Connection Check Failed'
+                        : 'Testing Connection...'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] opacity-90">{connectionCheck.message}</p>
+                </div>
+              )}
+
+              {/* Active Streaming Telemetry (when in a call) */}
+              {inCall && (
+                <div className="p-3 rounded-2xl bg-neutral-800/40 border border-neutral-700/40 text-xs text-neutral-300 flex items-center justify-between">
+                  <span className="text-[11px] text-neutral-400">Live Call Stats:</span>
+                  <span className="font-mono text-[11px] text-neutral-200">
+                    {netState.imgCount} frames • {netState.audioCount} audio pkts
+                  </span>
+                </div>
               )}
             </div>
           </div>
