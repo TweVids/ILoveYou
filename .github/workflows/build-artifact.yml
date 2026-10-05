@@ -1,4 +1,4 @@
-name: Build and Upload Artifact
+name: Build Android App
 
 on:
   push:
@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build Application Artifact
+  build-android:
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
@@ -21,102 +21,42 @@ jobs:
         with:
           node-version: 22
 
-      - name: Ensure required build files exist
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Accept Android SDK licenses
         run: |
-          echo "Checking repository build files..."
-          ls -la
-
-          # Recreate package.json if missing from remote repository checkout
-          if [ ! -f "package.json" ]; then
-            echo "package.json was missing; creating package.json..."
-            cat << 'EOF' > package.json
-{
-  "name": "react-example",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite --port=3000 --host=0.0.0.0",
-    "build": "vite build",
-    "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@google/genai": "^2.4.0",
-    "@tailwindcss/vite": "^4.3.3",
-    "@vitejs/plugin-react": "^6.1.1",
-    "lucide-react": "^0.546.0",
-    "react": "^19.0.1",
-    "react-dom": "^19.0.1",
-    "vite": "^8.3.0",
-    "express": "^4.21.2",
-    "dotenv": "^17.2.3",
-    "motion": "^12.23.24"
-  },
-  "devDependencies": {
-    "@types/node": "^22.14.0",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "autoprefixer": "^10.4.21",
-    "esbuild": "^0.25.0",
-    "tailwindcss": "^4.3.3",
-    "tsx": "^4.21.0",
-    "typescript": "^5.8.2",
-    "@types/express": "^4.17.21"
-  }
-}
-EOF
-          fi
-
-          # Recreate vite.config.ts if missing
-          if [ ! -f "vite.config.ts" ]; then
-            echo "vite.config.ts was missing; creating vite.config.ts..."
-            cat << 'EOF' > vite.config.ts
-import tailwindcss from '@tailwindcss/vite';
-import react from '@vitejs/plugin-react';
-import path from 'path';
-import {defineConfig} from 'vite';
-
-export default defineConfig(() => {
-  return {
-    plugins: [react(), tailwindcss()],
-    resolve: {
-      alias: {
-        '@': path.resolve(__dirname, '.'),
-      },
-    },
-    server: {
-      hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
-    },
-  };
-});
-EOF
-          fi
-
-          # Recreate src/main.tsx if missing
-          if [ ! -f "src/main.tsx" ]; then
-            echo "src/main.tsx was missing; creating src/main.tsx..."
-            mkdir -p src
-            cat << 'EOF' > src/main.tsx
-import {createRoot} from 'react-dom/client';
-import App from './App.tsx';
-import './index.css';
-
-createRoot(document.getElementById('root')!).render(<App />);
-EOF
-          fi
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses || true
 
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
-      - name: Build artifact
+      - name: Build Web Application
         run: npm run build
 
-      - name: Upload build artifact
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      - name: Grant execute permission for Gradle wrapper
+        run: chmod +x android/gradlew
+
+      - name: Build Android Debug APK
+        run: |
+          cd android
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK output
+        run: |
+          echo "Listing generated APKs:"
+          ls -la android/app/build/outputs/apk/debug/
+
+      - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-build-artifact
-          path: dist/
+          name: minimal-streamer-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
           retention-days: 14

@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Minimal Streamer</string>
+    <string name="title_activity_main">Minimal Streamer</string>
+    <string name="package_name">com.minimalstreamer.app</string>
+    <string name="custom_url_scheme">com.minimalstreamer.app</string>
+</resources>
