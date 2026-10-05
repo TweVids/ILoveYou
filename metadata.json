@@ -1,0 +1,12 @@
+{
+  "name": "Minimal Streamer",
+  "description": "A minimalist capture and streaming interface with warm pastel styling.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
