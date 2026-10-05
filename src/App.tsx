@@ -26,6 +26,19 @@ export default function App() {
   const isSendingFrameRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // Network and streaming activity status
+  const [netState, setNetState] = useState<{
+    status: 'idle' | 'connecting' | 'ok' | 'error';
+    lastError: string | null;
+    imgCount: number;
+    audioCount: number;
+  }>({
+    status: 'idle',
+    lastError: null,
+    imgCount: 0,
+    audioCount: 0,
+  });
+
   // Compute base URL for current provider
   const getBaseUrl = useCallback(() => {
     let base = provider === 'localhost' ? hostInput.trim() : endpointInput.trim();
@@ -67,11 +80,14 @@ export default function App() {
 
     const pollOrStream = async () => {
       try {
+        console.log(`[Audio Receiver] Connecting to ${listenEndpoint}...`);
         const response = await fetch(listenEndpoint, { signal });
         if (!response.ok || !response.body) {
+          console.warn(`[Audio Receiver] Stream response: ${response.status} ${response.statusText}`);
           return;
         }
 
+        console.log('[Audio Receiver] Stream connected, reading chunks...');
         const reader = response.body.getReader();
         while (!signal.aborted) {
           const { done, value } = await reader.read();
@@ -80,12 +96,12 @@ export default function App() {
             await playAudioChunk(value.buffer);
           }
         }
-      } catch {
-        // Retry connection if still in call
+      } catch (err: unknown) {
         if (!signal.aborted) {
+          console.warn('[Audio Receiver] Stream disconnected or unavailable:', (err as Error)?.message);
           setTimeout(() => {
             if (!signal.aborted) pollOrStream();
-          }, 1500);
+          }, 2000);
         }
       }
     };
@@ -96,6 +112,7 @@ export default function App() {
   // Manage call streaming lifecycle
   useEffect(() => {
     if (!inCall) {
+      setNetState({ status: 'idle', lastError: null, imgCount: 0, audioCount: 0 });
       // Stop and clean up all media and connections
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
@@ -127,6 +144,9 @@ export default function App() {
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
     const baseUrl = getBaseUrl();
+
+    setNetState({ status: 'connecting', lastError: null, imgCount: 0, audioCount: 0 });
+    console.log(`[Stream Started] Target server base URL: ${baseUrl}`);
 
     // Initialize AudioContext on user call gesture
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -183,14 +203,44 @@ export default function App() {
           const mediaRecorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
           mediaRecorderRef.current = mediaRecorder;
 
-          mediaRecorder.ondataavailable = (event) => {
+          mediaRecorder.ondataavailable = async (event) => {
             if (event.data && event.data.size > 0 && recorderOn && !abortController.signal.aborted) {
-              fetch(`${baseUrl}/v1/audio/sent`, {
-                method: 'POST',
-                headers: { 'Content-Type': event.data.type || 'audio/webm;codecs=opus' },
-                body: event.data,
-                signal: abortController.signal,
-              }).catch(() => {});
+              const audioTarget = `${baseUrl}/v1/audio/sent`;
+              try {
+                const res = await fetch(audioTarget, {
+                  method: 'POST',
+                  headers: { 'Content-Type': event.data.type || 'audio/webm;codecs=opus' },
+                  body: event.data,
+                  signal: abortController.signal,
+                });
+                if (res.ok) {
+                  console.log(`[Audio Sent] ${res.status} OK - ${event.data.size} bytes`);
+                  setNetState((prev) => ({
+                    ...prev,
+                    status: 'ok',
+                    lastError: null,
+                    audioCount: prev.audioCount + 1,
+                  }));
+                } else {
+                  const errorMsg = `Audio HTTP ${res.status}`;
+                  console.warn(`[Audio Sent Error] ${errorMsg}`);
+                  setNetState((prev) => ({
+                    ...prev,
+                    status: 'error',
+                    lastError: errorMsg,
+                  }));
+                }
+              } catch (err: unknown) {
+                if (!abortController.signal.aborted) {
+                  const msg = (err as Error)?.message || 'Audio network error';
+                  console.error('[Audio Sent Failed]', msg);
+                  setNetState((prev) => ({
+                    ...prev,
+                    status: 'error',
+                    lastError: msg.includes('Failed to fetch') ? 'Connection Failed (Check IP/CORS)' : msg,
+                  }));
+                }
+              }
             }
           };
 
@@ -219,18 +269,46 @@ export default function App() {
             isSendingFrameRef.current = true;
 
             canvas.toBlob(
-              (blob) => {
+              async (blob) => {
                 if (blob && !abortController.signal.aborted) {
-                  fetch(`${baseUrl}/v1/img/sent`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'image/webp' },
-                    body: blob,
-                    signal: abortController.signal,
-                  })
-                    .catch(() => {})
-                    .finally(() => {
-                      isSendingFrameRef.current = false;
+                  const imgTarget = `${baseUrl}/v1/img/sent`;
+                  try {
+                    const res = await fetch(imgTarget, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'image/webp' },
+                      body: blob,
+                      signal: abortController.signal,
                     });
+                    if (res.ok) {
+                      console.log(`[Image Sent] ${res.status} OK - ${blob.size} bytes`);
+                      setNetState((prev) => ({
+                        ...prev,
+                        status: 'ok',
+                        lastError: null,
+                        imgCount: prev.imgCount + 1,
+                      }));
+                    } else {
+                      const errorMsg = `Image HTTP ${res.status}`;
+                      console.warn(`[Image Sent Error] ${errorMsg}`);
+                      setNetState((prev) => ({
+                        ...prev,
+                        status: 'error',
+                        lastError: errorMsg,
+                      }));
+                    }
+                  } catch (err: unknown) {
+                    if (!abortController.signal.aborted) {
+                      const msg = (err as Error)?.message || 'Image network error';
+                      console.error('[Image Sent Failed]', msg);
+                      setNetState((prev) => ({
+                        ...prev,
+                        status: 'error',
+                        lastError: msg.includes('Failed to fetch') ? 'Connection Failed (Check IP/CORS)' : msg,
+                      }));
+                    }
+                  } finally {
+                    isSendingFrameRef.current = false;
+                  }
                 } else {
                   isSendingFrameRef.current = false;
                 }
@@ -280,6 +358,28 @@ export default function App() {
       <div className="h-[83%] w-full bg-black rounded-b-[40px] sm:rounded-b-[48px] shadow-[0_16px_36px_rgba(0,0,0,0.22)] relative z-10 overflow-hidden flex items-center justify-center">
         {/* Hidden canvas for 15fps WebP image capture */}
         <canvas ref={canvasRef} className="hidden" />
+
+        {/* Live streaming status badge on top left */}
+        {inCall && (
+          <div className="absolute top-4 left-4 sm:top-5 sm:left-5 z-20 flex items-center gap-2 px-3 py-1.5 rounded-xl bg-neutral-900/85 border border-white/10 backdrop-blur-xs text-xs font-mono select-none pointer-events-none">
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                netState.status === 'ok'
+                  ? 'bg-emerald-400 animate-pulse'
+                  : netState.status === 'error'
+                  ? 'bg-rose-500'
+                  : 'bg-amber-400 animate-pulse'
+              }`}
+            />
+            <span className="text-neutral-200">
+              {netState.status === 'ok'
+                ? `Live • ${netState.imgCount}f • ${netState.audioCount}a`
+                : netState.status === 'error'
+                ? (netState.lastError || 'Disconnected')
+                : 'Connecting...'}
+            </span>
+          </div>
+        )}
 
         {/* Live camera stream */}
         {inCall && cameraOn ? (
@@ -430,14 +530,19 @@ export default function App() {
               </div>
 
               {provider === 'localhost' ? (
-                <input
-                  type="text"
-                  key="localhost-input"
-                  value={hostInput}
-                  onChange={(e) => setHostInput(e.target.value)}
-                  placeholder="localhost:8000"
-                  className="w-full mt-1 px-3.5 py-2.5 rounded-xl bg-neutral-900 border border-neutral-700 text-sm text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-[#E57373] transition-all"
-                />
+                <>
+                  <input
+                    type="text"
+                    key="localhost-input"
+                    value={hostInput}
+                    onChange={(e) => setHostInput(e.target.value)}
+                    placeholder="localhost:8000"
+                    className="w-full mt-1 px-3.5 py-2.5 rounded-xl bg-neutral-900 border border-neutral-700 text-sm text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-[#E57373] transition-all"
+                  />
+                  <p className="text-[11px] text-neutral-400 leading-normal mt-1">
+                    <span className="text-[#E57373] font-semibold">Tip for Android:</span> On a phone, &apos;localhost&apos; is the phone itself. Use your PC&apos;s Wi-Fi IP (e.g. <code className="text-neutral-200">http://192.168.1.X:8000</code>) or USB <code className="text-neutral-200">adb reverse tcp:8000 tcp:8000</code>.
+                  </p>
+                </>
               ) : (
                 <input
                   type="text"
