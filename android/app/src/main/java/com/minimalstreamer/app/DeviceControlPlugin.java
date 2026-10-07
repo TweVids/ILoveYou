@@ -31,7 +31,32 @@ public class DeviceControlPlugin extends Plugin {
             Log.w(TAG, "Failed getting display metrics", e);
         }
 
+        ret.put("foregroundServiceRunning", StreamerForegroundService.isServiceRunning());
         call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void startForegroundService(PluginCall call) {
+        try {
+            StreamerForegroundService.start(getContext());
+            JSObject ret = new JSObject();
+            ret.put("success", true);
+            call.resolve(ret);
+        } catch (Exception e) {
+            call.reject("Failed starting foreground service: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void stopForegroundService(PluginCall call) {
+        try {
+            StreamerForegroundService.stop(getContext());
+            JSObject ret = new JSObject();
+            ret.put("success", true);
+            call.resolve(ret);
+        } catch (Exception e) {
+            call.reject("Failed stopping foreground service: " + e.getMessage());
+        }
     }
 
     @PluginMethod

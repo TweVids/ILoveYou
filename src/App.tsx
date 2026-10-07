@@ -1136,12 +1136,31 @@ export default function App() {
       }
       setIsSharingDeviceScreen(false);
       stopAudioPlayer();
+
+      // Stop native Android foreground service
+      const DeviceControl = (window as unknown as {
+        Capacitor?: { Plugins?: { DeviceControl?: { stopForegroundService?: () => Promise<any> } } };
+      }).Capacitor?.Plugins?.DeviceControl;
+      if (DeviceControl && typeof DeviceControl.stopForegroundService === 'function') {
+        DeviceControl.stopForegroundService().catch(() => {});
+      }
+
       return;
     }
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
     const baseUrl = getBaseUrl();
+
+    // Start native Android foreground service to keep network & streaming active in background
+    const DeviceControl = (window as unknown as {
+      Capacitor?: { Plugins?: { DeviceControl?: { startForegroundService?: () => Promise<any> } } };
+    }).Capacitor?.Plugins?.DeviceControl;
+    if (DeviceControl && typeof DeviceControl.startForegroundService === 'function') {
+      DeviceControl.startForegroundService().catch((e: unknown) => {
+        console.warn('[ForegroundService] Start failed:', e);
+      });
+    }
 
     setNetState({
       status: 'connecting',
@@ -1413,6 +1432,14 @@ export default function App() {
         screenVideoRef.current.srcObject = null;
       }
       setIsSharingDeviceScreen(false);
+
+      // Stop native Android foreground service
+      const DeviceControl = (window as unknown as {
+        Capacitor?: { Plugins?: { DeviceControl?: { stopForegroundService?: () => Promise<any> } } };
+      }).Capacitor?.Plugins?.DeviceControl;
+      if (DeviceControl && typeof DeviceControl.stopForegroundService === 'function') {
+        DeviceControl.stopForegroundService().catch(() => {});
+      }
     };
   }, [
     inCall,
