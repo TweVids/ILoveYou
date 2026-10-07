@@ -286,7 +286,7 @@ export default function App() {
     const pollOrStream = async () => {
       try {
         console.log(`[Audio Receiver] Connecting to ${listenEndpoint}...`);
-        const response = await fetch(listenEndpoint, { signal });
+        const response = await fetch(listenEndpoint, { signal, headers: { 'ngrok-skip-browser-warning': '1' }, });
         if (!response.ok || !response.body) {
           console.warn(`[Audio Receiver] Stream response: ${response.status} ${response.statusText}`);
           return;
