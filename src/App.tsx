@@ -263,6 +263,9 @@ export default function App() {
       audioElemRef.current.pause();
       audioElemRef.current.removeAttribute('src');
       audioElemRef.current.load();
+      if (audioElemRef.current.parentNode) {
+        audioElemRef.current.parentNode.removeChild(audioElemRef.current);
+      }
       audioElemRef.current = null;
     }
     sourceBufferRef.current = null;
@@ -309,6 +312,8 @@ export default function App() {
         const audio = new Audio();
         audio.autoplay = true;
         (audio as unknown as { playsInline: boolean }).playsInline = true;
+        audio.style.display = 'none';
+        document.body.appendChild(audio);
         audio.src = URL.createObjectURL(ms);
         audioElemRef.current = audio;
         mediaSourceRef.current = ms;
@@ -350,7 +355,6 @@ export default function App() {
             () => {
               try {
                 const sb = ms.addSourceBuffer(supportedType);
-                sb.mode = 'sequence';
                 sourceBufferRef.current = sb;
 
                 sb.addEventListener('error', (e) => {
