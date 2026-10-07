@@ -288,89 +288,166 @@ export default function App() {
           console.warn(`[Audio Receiver] Stream response: ${response.status} ${response.statusText}`);
           return;
         }
+        console.log('[Audio Receiver] Stream connected');
 
-        console.log('[Audio Receiver] Stream connected, preparing Opus playback queue...');
-
-        // Setup MediaSource for streaming WebM/Ogg Opus if supported
+        // ---- pick the best codec the browser supports ----
         const supportedType = typeof MediaSource !== 'undefined' && [
           'audio/webm; codecs="opus"',
           'audio/ogg; codecs="opus"',
           'audio/webm',
         ].find((type) => MediaSource.isTypeSupported(type));
 
+        if (!supportedType) {
+          console.error('[Audio Receiver] MediaSource not supported in this browser. Aborting.');
+          return;
+        }
+        console.log('[Audio Receiver] Using codec:', supportedType);
+
         let useMediaSource = false;
-        if (supportedType) {
-          try {
-            const ms = new MediaSource();
-            const audio = new Audio();
-            audio.src = URL.createObjectURL(ms);
-            audioElemRef.current = audio;
-            mediaSourceRef.current = ms;
 
-            await new Promise<void>((resolve) => {
-              const onOpen = () => {
-                ms.removeEventListener('sourceopen', onOpen);
-                try {
-                  const sb = ms.addSourceBuffer(supportedType);
-                  sb.mode = 'sequence';
-                  sourceBufferRef.current = sb;
+        const ms = new MediaSource();
+        const audio = new Audio();
+        audio.autoplay = true;
+        (audio as unknown as { playsInline: boolean }).playsInline = true;
+        audio.src = URL.createObjectURL(ms);
+        audioElemRef.current = audio;
+        mediaSourceRef.current = ms;
 
-                  sb.addEventListener('updateend', () => {
-                    if (chunkQueueRef.current.length > 0 && !sb.updating) {
-                      const next = chunkQueueRef.current.shift();
-                      if (next) {
-                        try {
-                          sb.appendBuffer(next);
-                        } catch {
-                          // ignore
-                        }
+        ms.addEventListener('sourceopen', () => console.log('[MSE] sourceopen'));
+        ms.addEventListener('sourceclose', () => console.warn('[MSE] sourceclose'));
+        ms.addEventListener('sourceended', () => console.warn('[MSE] sourceended'));
+        audio.addEventListener('error', () => console.error('[audio] error', (audio as unknown as { error: unknown }).error));
+        audio.addEventListener('stalled', () => console.warn('[audio] stalled'));
+        audio.addEventListener('waiting', () => console.warn('[audio] waiting'));
+        audio.addEventListener('playing', () => console.log('[audio] playing'));
+        audio.addEventListener('timeupdate', () => {
+          const customAudio = audio as unknown as { _lastT?: number };
+          if (Math.floor(audio.currentTime) !== Math.floor(customAudio._lastT || -1)) {
+            customAudio._lastT = audio.currentTime;
+            console.log(
+              '[audio] t=',
+              audio.currentTime.toFixed(2),
+              'readyState=',
+              audio.readyState,
+              'buffered=',
+              audio.buffered.length,
+              'paused=',
+              audio.paused
+            );
+          }
+        });
+
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+
+          ms.addEventListener(
+            'sourceopen',
+            () => {
+              try {
+                const sb = ms.addSourceBuffer(supportedType);
+                sb.mode = 'sequence';
+                sourceBufferRef.current = sb;
+
+                sb.addEventListener('error', (e) => {
+                  console.error('[MSE] SourceBuffer error', e);
+                });
+                sb.addEventListener('updateend', () => {
+                  if (chunkQueueRef.current.length > 0 && !sb.updating) {
+                    const next = chunkQueueRef.current.shift();
+                    if (next) {
+                      try {
+                        sb.appendBuffer(next);
+                      } catch (e) {
+                        console.error('[MSE] appendBuffer failed', e);
                       }
                     }
-                  });
-                  useMediaSource = true;
-                  audio.play().catch(() => {});
-                } catch (e) {
-                  console.warn('[Audio Receiver] SourceBuffer add error:', e);
-                }
-                resolve();
-              };
-              ms.addEventListener('sourceopen', onOpen);
-              setTimeout(resolve, 300); // timeout fallback to Web Audio
-            });
-          } catch (e) {
-            console.warn('[Audio Receiver] MediaSource fallback:', e);
-            useMediaSource = false;
-          }
+                  }
+                  if (
+                    audioElemRef.current &&
+                    audioElemRef.current.paused &&
+                    audioElemRef.current.buffered.length > 0
+                  ) {
+                    audioElemRef.current.play().catch((e) =>
+                      console.warn('[audio] play() rejected:', e)
+                    );
+                  }
+                });
+
+                useMediaSource = true;
+                audio
+                  .play()
+                  .then(() => console.log('[audio] play() resolved'))
+                  .catch((e) => console.warn('[audio] play() rejected:', e));
+
+                console.log('[Audio Receiver] MediaSource ready, codec=', supportedType);
+              } catch (e) {
+                console.error('[Audio Receiver] addSourceBuffer failed', e);
+              }
+              finish();
+            },
+            { once: true }
+          );
+
+          setTimeout(() => {
+            if (!settled) {
+              console.error('[Audio Receiver] sourceopen timeout — MSE did not initialise');
+              finish();
+            }
+          }, 5000);
+        });
+
+        if (!useMediaSource) {
+          console.error('[Audio Receiver] MediaSource failed to initialise. Aborting receiver.');
+          return;
         }
 
+        // ---- read the stream ----
         const reader = response.body.getReader();
+        let totalBytes = 0;
+        let totalChunks = 0;
         while (!signal.aborted) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (value && value.byteLength > 0) {
-            const sb = sourceBufferRef.current;
-            if (useMediaSource && sb) {
-              if (sb.updating || chunkQueueRef.current.length > 0) {
-                chunkQueueRef.current.push(value);
-              } else {
-                try {
-                  sb.appendBuffer(value);
-                } catch {
-                  chunkQueueRef.current.push(value);
-                }
-              }
-              if (audioElemRef.current && audioElemRef.current.paused) {
-                audioElemRef.current.play().catch(() => {});
-              }
-            } else {
-              // Web Audio API fallback for standalone chunks
-              await playAudioChunk(value.buffer);
+          if (!value || value.byteLength === 0) continue;
+
+          totalChunks += 1;
+          totalBytes += value.byteLength;
+          if (totalChunks % 20 === 1) {
+            console.log(
+              `[Audio Receiver] chunk ${totalChunks}, ${value.byteLength} B (total ${totalBytes} B)`
+            );
+          }
+
+          const sb = sourceBufferRef.current;
+          if (!sb) continue;
+
+          if (sb.updating || chunkQueueRef.current.length > 0) {
+            chunkQueueRef.current.push(value);
+          } else {
+            try {
+              sb.appendBuffer(value);
+            } catch (e) {
+              console.warn('[MSE] direct append failed, queued:', e);
+              chunkQueueRef.current.push(value);
             }
           }
         }
-      } catch (err: unknown) {
+
+        console.warn(
+          '[Audio Receiver] reader loop ended after',
+          totalChunks,
+          'chunks /',
+          totalBytes,
+          'bytes'
+        );
+      } catch (err) {
         if (!signal.aborted) {
-          console.warn('[Audio Receiver] Stream disconnected or unavailable:', (err as Error)?.message);
+          console.warn('[Audio Receiver] stream error:', err);
           setTimeout(() => {
             if (!signal.aborted) pollOrStream();
           }, 2000);
@@ -379,7 +456,7 @@ export default function App() {
     };
 
     pollOrStream();
-  }, [playAudioChunk]);
+  }, []);
 
   // Manage call streaming lifecycle
   useEffect(() => {
