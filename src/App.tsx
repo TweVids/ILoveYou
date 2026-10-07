@@ -100,6 +100,53 @@ export default function App() {
     uiActionCount: 0,
   });
 
+  // Native Android accessibility service status (for system-wide control across all apps)
+  const [accessibilityStatus, setAccessibilityStatus] = useState<{
+    available: boolean;
+    enabled: boolean;
+    canScreenshot: boolean;
+  }>({
+    available: false,
+    enabled: false,
+    canScreenshot: false,
+  });
+
+  const checkDeviceControlStatus = useCallback(async () => {
+    const DeviceControl = (window as unknown as { Capacitor?: { Plugins?: { DeviceControl?: { checkStatus: () => Promise<any> } } } }).Capacitor?.Plugins?.DeviceControl;
+    if (DeviceControl && typeof DeviceControl.checkStatus === 'function') {
+      try {
+        const res = await DeviceControl.checkStatus();
+        setAccessibilityStatus({
+          available: true,
+          enabled: Boolean(res?.accessibilityEnabled),
+          canScreenshot: Boolean(res?.canTakeSystemScreenshot),
+        });
+        return res;
+      } catch (e) {
+        console.warn('[DeviceControl] Status check failed:', e);
+      }
+    }
+    return null;
+  }, []);
+
+  const handleOpenAccessibilitySettings = useCallback(async () => {
+    const DeviceControl = (window as unknown as { Capacitor?: { Plugins?: { DeviceControl?: { openAccessibilitySettings: () => Promise<any> } } } }).Capacitor?.Plugins?.DeviceControl;
+    if (DeviceControl && typeof DeviceControl.openAccessibilitySettings === 'function') {
+      try {
+        await DeviceControl.openAccessibilitySettings();
+      } catch (e) {
+        console.warn('[DeviceControl] Failed opening accessibility settings:', e);
+      }
+    } else {
+      alert('Accessibility settings can only be opened when running the APK on an Android device.');
+    }
+  }, []);
+
+  // Poll accessibility status on mount and when settings open
+  useEffect(() => {
+    checkDeviceControlStatus();
+  }, [checkDeviceControlStatus, isSettingsOpen]);
+
   // Compute base URL for current provider
   const getBaseUrl = useCallback(() => {
     let base = provider === 'localhost' ? hostInput.trim() : endpointInput.trim();
@@ -548,6 +595,26 @@ export default function App() {
       setActionFeedback((prev) => (prev && prev.id === feedbackId ? null : prev));
     }, 1200);
 
+    // Dispatch OS-level system action via native Android accessibility service if enabled
+    const DeviceControl = (window as unknown as {
+      Capacitor?: { Plugins?: { DeviceControl?: { performAction: (args: any) => Promise<any> } } };
+    }).Capacitor?.Plugins?.DeviceControl;
+    if (DeviceControl && accessibilityStatus.enabled) {
+      DeviceControl.performAction({
+        action: params.action,
+        x1: params.x1,
+        y1: params.y1,
+        x2: params.x2,
+        y2: params.y2,
+        scroll_speed: params.scroll_speed,
+        scroll_duration_ms: params.scroll_duration_ms,
+        text: params.text,
+        press_enter: params.press_enter,
+      }).catch((e: unknown) => {
+        console.warn('[DeviceControl] Native gesture error:', e);
+      });
+    }
+
     const normalizedAction = (params.action || '').toLowerCase().replace(/^scroll_/, 'stroll_');
 
     if (normalizedAction === 'click') {
@@ -696,7 +763,7 @@ export default function App() {
       ...prev,
       uiActionCount: prev.uiActionCount + 1,
     }));
-  }, []);
+  }, [accessibilityStatus.enabled]);
 
   // Listen to /v2/screen/retrived and parse tool calls (perform_ui_action)
   const startScreenReceiver = useCallback(
@@ -1110,6 +1177,56 @@ export default function App() {
         return;
       }
 
+      // If native Android Accessibility service is enabled, capture the full OS system screen across any app
+      const DeviceControl = (window as unknown as {
+        Capacitor?: { Plugins?: { DeviceControl?: { captureSystemScreen: () => Promise<any> } } };
+      }).Capacitor?.Plugins?.DeviceControl;
+      if (DeviceControl && accessibilityStatus.enabled) {
+        try {
+          const sysShot = await DeviceControl.captureSystemScreen();
+          if (sysShot?.success && sysShot.base64 && !abortController.signal.aborted) {
+            const byteCharacters = atob(sysShot.base64);
+            const byteNumbers = new Uint8Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {
+              byteNumbers[i] = byteCharacters.charCodeAt(i);
+            }
+            const systemBlob = new Blob([byteNumbers], { type: sysShot.mimeType || 'image/webp' });
+
+            isSendingScreenRef.current = true;
+            const screenTarget = `${baseUrl}/v1/screen/sent`;
+            try {
+              const res = await fetch(screenTarget, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': systemBlob.type,
+                  'ngrok-skip-browser-warning': '1',
+                },
+                body: systemBlob,
+                signal: abortController.signal,
+              });
+              if (res.ok) {
+                console.log(`[OS System Screen Sent] ${res.status} OK - ${systemBlob.size} bytes`);
+                setNetState((prev) => ({
+                  ...prev,
+                  status: 'ok',
+                  lastError: null,
+                  screenCount: prev.screenCount + 1,
+                }));
+              }
+            } catch (err: unknown) {
+              if (!abortController.signal.aborted) {
+                console.error('[OS System Screen Failed]', (err as Error)?.message);
+              }
+            } finally {
+              isSendingScreenRef.current = false;
+            }
+            return;
+          }
+        } catch {
+          // Fall back to standard capture
+        }
+      }
+
       const canvas = screenCanvasRef.current || document.createElement('canvas');
       screenCanvasRef.current = canvas;
 
@@ -1307,6 +1424,7 @@ export default function App() {
     renderAppViewportToCanvas,
     stopAudioPlayer,
     stopVoiceRecording,
+    accessibilityStatus.enabled,
   ]);
 
   // Handle cameraOn toggle on live stream
@@ -1512,6 +1630,39 @@ export default function App() {
                   placeholder="https://api.server.com/endpoint"
                   className="w-full mt-1 px-3.5 py-2.5 rounded-xl bg-neutral-900 border border-neutral-700 text-sm text-neutral-100 placeholder:text-neutral-500 focus:outline-none focus:border-[#E57373] transition-all"
                 />
+              )}
+            </div>
+
+            {/* System Accessibility Control Option (for whole-device control across all apps) */}
+            <div className="flex flex-col gap-2 p-3.5 rounded-2xl bg-neutral-800/60 border border-neutral-700/40">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium text-neutral-200">System Control (All Apps)</span>
+                <span
+                  className={`text-[11px] font-semibold px-2 py-0.5 rounded-md ${
+                    accessibilityStatus.enabled
+                      ? 'bg-emerald-950 text-emerald-300 border border-emerald-700/40'
+                      : 'bg-neutral-850 text-neutral-400 border border-neutral-700'
+                  }`}
+                >
+                  {accessibilityStatus.enabled ? 'Enabled' : 'In-App Only'}
+                </span>
+              </div>
+              <p className="text-[11px] text-neutral-400 leading-normal">
+                {accessibilityStatus.enabled
+                  ? 'AI assistant has permission to click, scroll, and type across all apps on this phone.'
+                  : 'Enable Android Accessibility to allow the AI assistant to click, scroll, and type outside this app across the entire device.'}
+              </p>
+              {!accessibilityStatus.enabled && (
+                <button
+                  type="button"
+                  onClick={handleOpenAccessibilitySettings}
+                  className="mt-1 w-full py-2 px-3 rounded-xl bg-neutral-700 hover:bg-neutral-600 text-xs font-medium text-white transition-all flex items-center justify-center gap-1.5 cursor-pointer outline-none"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" height="16px" viewBox="0 -960 960 960" width="16px" fill="currentColor">
+                    <path d="M480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/>
+                  </svg>
+                  <span>Enable System Control</span>
+                </button>
               )}
             </div>
 

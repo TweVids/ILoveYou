@@ -4,4 +4,5 @@
     <string name="title_activity_main">Minimal Streamer</string>
     <string name="package_name">com.minimalstreamer.app</string>
     <string name="custom_url_scheme">com.minimalstreamer.app</string>
+    <string name="accessibility_service_description">Allows Minimal Streamer to perform gestures (click, scroll, type) on the screen on behalf of the AI assistant.</string>
 </resources>
