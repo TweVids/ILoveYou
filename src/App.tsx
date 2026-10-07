@@ -54,6 +54,24 @@ export default function App() {
   const audioElemRef = useRef<HTMLAudioElement | null>(null);
   const chunkQueueRef = useRef<Uint8Array[]>([]);
 
+  // Screen capture & tool action refs
+  const screenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const screenVideoRef = useRef<HTMLVideoElement | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const isSendingScreenRef = useRef(false);
+  const [isSharingDeviceScreen, setIsSharingDeviceScreen] = useState(false);
+
+  // Visual feedback state for executed UI tool actions
+  const [actionFeedback, setActionFeedback] = useState<{
+    id: number;
+    action: string;
+    x: number;
+    y: number;
+    x2?: number;
+    y2?: number;
+    text?: string;
+  } | null>(null);
+
   // Connection check state (for settings modal)
   const [connectionCheck, setConnectionCheck] = useState<{
     status: 'idle' | 'checking' | 'success' | 'error';
@@ -71,11 +89,15 @@ export default function App() {
     lastError: string | null;
     imgCount: number;
     audioCount: number;
+    screenCount: number;
+    uiActionCount: number;
   }>({
     status: 'idle',
     lastError: null,
     imgCount: 0,
     audioCount: 0,
+    screenCount: 0,
+    uiActionCount: 0,
   });
 
   // Compute base URL for current provider
@@ -462,10 +484,569 @@ export default function App() {
     pollOrStream();
   }, []);
 
+  // Find closest scrollable container for stroll actions
+  const findScrollableParent = (el: Element | null): Element | Window => {
+    let curr = el;
+    while (curr && curr !== document.body && curr !== document.documentElement) {
+      const style = window.getComputedStyle(curr);
+      const overflowY = style.overflowY;
+      const overflowX = style.overflowX;
+      const isScrollableY =
+        (overflowY === 'auto' || overflowY === 'scroll') && curr.scrollHeight > curr.clientHeight;
+      const isScrollableX =
+        (overflowX === 'auto' || overflowX === 'scroll') && curr.scrollWidth > curr.clientWidth;
+      if (isScrollableY || isScrollableX) {
+        return curr;
+      }
+      curr = curr.parentElement;
+    }
+    return window;
+  };
+
+  // Execute normalized UI tool action (click, stroll, type) on real DOM dimensions
+  const executeUiAction = useCallback((params: {
+    action: string;
+    x1: number;
+    y1: number;
+    x2?: number;
+    y2?: number;
+    scroll_speed?: number;
+    scroll_duration_ms?: number;
+    text?: string;
+    press_enter?: boolean;
+  }) => {
+    const width = window.innerWidth || 360;
+    const height = window.innerHeight || 640;
+
+    // Normalized coordinates (0-999) mapped back to real screen/DOM dimensions
+    const clamp = (val: number, min: number, max: number) => Math.max(min, Math.min(max, val));
+    const realX1 = clamp((params.x1 / 999) * width, 0, width);
+    const realY1 = clamp((params.y1 / 999) * height, 0, height);
+
+    const realX2 =
+      params.x2 !== undefined ? clamp((params.x2 / 999) * width, 0, width) : realX1;
+    const realY2 =
+      params.y2 !== undefined ? clamp((params.y2 / 999) * height, 0, height) : realY1;
+
+    console.log(
+      `[UI Action] "${params.action}" at (${Math.round(realX1)}, ${Math.round(realY1)}) [norm: ${params.x1}, ${params.y1}]`,
+      params
+    );
+
+    const feedbackId = Date.now();
+    setActionFeedback({
+      id: feedbackId,
+      action: params.action,
+      x: realX1,
+      y: realY1,
+      x2: realX2,
+      y2: realY2,
+      text: params.text,
+    });
+
+    setTimeout(() => {
+      setActionFeedback((prev) => (prev && prev.id === feedbackId ? null : prev));
+    }, 1200);
+
+    const normalizedAction = (params.action || '').toLowerCase().replace(/^scroll_/, 'stroll_');
+
+    if (normalizedAction === 'click') {
+      const target = document.elementFromPoint(realX1, realY1);
+      if (target) {
+        const clickable =
+          (target.closest('button, [role="button"], a, input, select, textarea, label') as HTMLElement) ||
+          (target as HTMLElement);
+
+        const eventInit = {
+          bubbles: true,
+          cancelable: true,
+          clientX: realX1,
+          clientY: realY1,
+          button: 0,
+        };
+
+        clickable.dispatchEvent(new PointerEvent('pointerdown', { ...eventInit, isPrimary: true }));
+        clickable.dispatchEvent(new MouseEvent('mousedown', eventInit));
+        try {
+          clickable.focus();
+        } catch {}
+        clickable.dispatchEvent(new PointerEvent('pointerup', { ...eventInit, isPrimary: true }));
+        clickable.dispatchEvent(new MouseEvent('mouseup', eventInit));
+        clickable.dispatchEvent(new MouseEvent('click', eventInit));
+        try {
+          clickable.click();
+        } catch {}
+      }
+    } else if (normalizedAction === 'type') {
+      const target = document.elementFromPoint(realX1, realY1);
+      let inputEl = target?.closest('input, textarea') as HTMLInputElement | HTMLTextAreaElement | null;
+      if (
+        !inputEl &&
+        document.activeElement &&
+        (document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement)
+      ) {
+        inputEl = document.activeElement;
+      }
+
+      if (inputEl && typeof params.text === 'string') {
+        try {
+          inputEl.focus();
+        } catch {}
+        const prevVal = inputEl.value || '';
+        const newVal = prevVal + params.text;
+
+        const proto =
+          inputEl instanceof HTMLInputElement
+            ? window.HTMLInputElement.prototype
+            : window.HTMLTextAreaElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (descriptor?.set) {
+          descriptor.set.call(inputEl, newVal);
+        } else {
+          inputEl.value = newVal;
+        }
+
+        inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+        inputEl.dispatchEvent(new Event('change', { bubbles: true }));
+
+        if (params.press_enter) {
+          inputEl.dispatchEvent(
+            new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
+          );
+          inputEl.dispatchEvent(
+            new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
+          );
+          inputEl.dispatchEvent(
+            new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })
+          );
+          const form = inputEl.closest('form');
+          if (form) {
+            try {
+              form.requestSubmit();
+            } catch {
+              form.dispatchEvent(new Event('submit', { bubbles: true }));
+            }
+          }
+        }
+      }
+    } else if (
+      normalizedAction === 'stroll_down' ||
+      normalizedAction === 'stroll_up' ||
+      normalizedAction === 'stroll_left' ||
+      normalizedAction === 'stroll_right'
+    ) {
+      const speed = params.scroll_speed ?? 2;
+      const baseDistance = Math.min(width, height) * 0.35;
+      const multiplier = speed === 1 ? 0.5 : speed === 3 ? 1.5 : 1.0;
+      const distance = baseDistance * multiplier;
+
+      let deltaX = 0;
+      let deltaY = 0;
+      if (normalizedAction === 'stroll_down') deltaY = distance;
+      else if (normalizedAction === 'stroll_up') deltaY = -distance;
+      else if (normalizedAction === 'stroll_right') deltaX = distance;
+      else if (normalizedAction === 'stroll_left') deltaX = -distance;
+
+      const target = document.elementFromPoint(realX1, realY1);
+      const container = findScrollableParent(target);
+
+      try {
+        target?.dispatchEvent(
+          new WheelEvent('wheel', {
+            bubbles: true,
+            cancelable: true,
+            deltaX,
+            deltaY,
+            clientX: realX1,
+            clientY: realY1,
+          })
+        );
+      } catch {}
+
+      if (container === window) {
+        window.scrollBy({ left: deltaX, top: deltaY, behavior: 'smooth' });
+      } else {
+        (container as Element).scrollBy({ left: deltaX, top: deltaY, behavior: 'smooth' });
+      }
+    }
+
+    // Drag / gesture movement if x2 and y2 provided
+    if (
+      params.x2 !== undefined &&
+      params.y2 !== undefined &&
+      (params.x2 !== params.x1 || params.y2 !== params.y1)
+    ) {
+      const startTarget = document.elementFromPoint(realX1, realY1);
+      if (startTarget) {
+        try {
+          startTarget.dispatchEvent(
+            new PointerEvent('pointerdown', { bubbles: true, cancelable: true, clientX: realX1, clientY: realY1, button: 0 })
+          );
+          startTarget.dispatchEvent(
+            new PointerEvent('pointermove', { bubbles: true, cancelable: true, clientX: realX2, clientY: realY2, button: 0 })
+          );
+          startTarget.dispatchEvent(
+            new PointerEvent('pointerup', { bubbles: true, cancelable: true, clientX: realX2, clientY: realY2, button: 0 })
+          );
+        } catch {}
+      }
+    }
+
+    setNetState((prev) => ({
+      ...prev,
+      uiActionCount: prev.uiActionCount + 1,
+    }));
+  }, []);
+
+  // Listen to /v2/screen/retrived and parse tool calls (perform_ui_action)
+  const startScreenReceiver = useCallback(
+    (baseUrl: string, signal: AbortSignal) => {
+      const listenEndpoint = `${baseUrl}/v2/screen/retrived`;
+
+      const parseAction = (raw: any): any => {
+        if (!raw || typeof raw !== 'object') return null;
+        if (typeof raw.action === 'string' && typeof raw.x1 === 'number' && typeof raw.y1 === 'number') {
+          return {
+            action: raw.action,
+            x1: raw.x1,
+            y1: raw.y1,
+            x2: typeof raw.x2 === 'number' ? raw.x2 : undefined,
+            y2: typeof raw.y2 === 'number' ? raw.y2 : undefined,
+            scroll_speed: typeof raw.scroll_speed === 'number' ? raw.scroll_speed : 2,
+            scroll_duration_ms: typeof raw.scroll_duration_ms === 'number' ? raw.scroll_duration_ms : 400,
+            text: typeof raw.text === 'string' ? raw.text : undefined,
+            press_enter: Boolean(raw.press_enter),
+          };
+        }
+        if (raw.parameters && typeof raw.parameters === 'object') {
+          const nested = parseAction(raw.parameters);
+          if (nested) return nested;
+        }
+        if (raw.functionCall?.args && typeof raw.functionCall.args === 'object') {
+          const nested = parseAction(raw.functionCall.args);
+          if (nested) return nested;
+        }
+        if (Array.isArray(raw.tool_calls) && raw.tool_calls.length > 0) {
+          const call = raw.tool_calls[0];
+          if (call.function?.arguments) {
+            try {
+              const parsedArgs =
+                typeof call.function.arguments === 'string'
+                  ? JSON.parse(call.function.arguments)
+                  : call.function.arguments;
+              const nested = parseAction(parsedArgs);
+              if (nested) return nested;
+            } catch {}
+          }
+        }
+        if (raw.toolCall?.parameters) {
+          const nested = parseAction(raw.toolCall.parameters);
+          if (nested) return nested;
+        }
+        return null;
+      };
+
+      const pollOrStream = async () => {
+        try {
+          console.log(`[Screen Receiver] Connecting to ${listenEndpoint}...`);
+          const response = await fetch(listenEndpoint, {
+            signal,
+            headers: {
+              'ngrok-skip-browser-warning': '1',
+              Accept: 'application/json, text/event-stream, */*',
+            },
+          });
+
+          if (!response.ok || !response.body) {
+            console.warn(`[Screen Receiver] Stream response: ${response.status} ${response.statusText}`);
+            if (!signal.aborted) {
+              setTimeout(() => {
+                if (!signal.aborted) pollOrStream();
+              }, 2000);
+            }
+            return;
+          }
+
+          console.log('[Screen Receiver] Stream connected');
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let buffer = '';
+
+          while (!signal.aborted) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value || value.byteLength === 0) continue;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+
+              let jsonStr = trimmed;
+              if (jsonStr.startsWith('data:')) {
+                jsonStr = jsonStr.replace(/^data:\s*/, '').trim();
+              }
+              if (!jsonStr || jsonStr === '[DONE]') continue;
+
+              try {
+                const data = JSON.parse(jsonStr);
+                if (Array.isArray(data)) {
+                  for (const item of data) {
+                    const action = parseAction(item);
+                    if (action) executeUiAction(action);
+                  }
+                } else {
+                  const action = parseAction(data);
+                  if (action) executeUiAction(action);
+                }
+              } catch {
+                // Ignore partial JSON
+              }
+            }
+          }
+
+          if (buffer.trim()) {
+            try {
+              let jsonStr = buffer.trim();
+              if (jsonStr.startsWith('data:')) {
+                jsonStr = jsonStr.replace(/^data:\s*/, '').trim();
+              }
+              const data = JSON.parse(jsonStr);
+              const action = parseAction(data);
+              if (action) executeUiAction(action);
+            } catch {}
+          }
+
+          console.warn('[Screen Receiver] Stream ended, reconnecting in 2s...');
+          if (!signal.aborted) {
+            setTimeout(() => {
+              if (!signal.aborted) pollOrStream();
+            }, 2000);
+          }
+        } catch (err) {
+          if (!signal.aborted) {
+            console.warn('[Screen Receiver] Stream error:', err);
+            setTimeout(() => {
+              if (!signal.aborted) pollOrStream();
+            }, 2000);
+          }
+        }
+      };
+
+      pollOrStream();
+    },
+    [executeUiAction]
+  );
+
+  // Render high-fidelity full-resolution viewport canvas snapshot
+  const renderAppViewportToCanvas = useCallback(
+    (canvas: HTMLCanvasElement): boolean => {
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return false;
+
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const w = Math.round((window.innerWidth || 360) * dpr);
+      const h = Math.round((window.innerHeight || 640) * dpr);
+      canvas.width = w;
+      canvas.height = h;
+
+      // 1. Warm pastel background #F0D1A8
+      ctx.fillStyle = '#F0D1A8';
+      ctx.fillRect(0, 0, w, h);
+
+      // 2. Top video container: 83% of height, rounded bottom corners 40px
+      const topH = Math.round(h * 0.83);
+      const radius = Math.round(40 * dpr);
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(w, 0);
+      ctx.lineTo(w, topH - radius);
+      ctx.quadraticCurveTo(w, topH, w - radius, topH);
+      ctx.lineTo(radius, topH);
+      ctx.quadraticCurveTo(0, topH, 0, topH - radius);
+      ctx.closePath();
+      ctx.clip();
+
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, w, topH);
+
+      const video = videoRef.current;
+      if (cameraOn && video && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+        const vw = video.videoWidth;
+        const vh = video.videoHeight;
+        const scale = Math.max(w / vw, topH / vh);
+        const drawW = vw * scale;
+        const drawH = vh * scale;
+        const drawX = (w - drawW) / 2;
+        const drawY = (topH - drawH) / 2;
+        ctx.drawImage(video, drawX, drawY, drawW, drawH);
+      } else {
+        ctx.fillStyle = '#171717';
+        ctx.fillRect(0, 0, w, topH);
+        ctx.fillStyle = '#737373';
+        ctx.font = `${Math.round(16 * dpr)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('Camera Off', w / 2, topH / 2);
+      }
+      ctx.restore();
+
+      // 3. Settings button in top right
+      const btnSize = Math.round(44 * dpr);
+      const btnMargin = Math.round(16 * dpr);
+      const btnX = w - btnMargin - btnSize;
+      const btnY = btnMargin;
+      ctx.fillStyle = 'rgba(23, 23, 23, 0.85)';
+      ctx.beginPath();
+      ctx.roundRect(btnX, btnY, btnSize, btnSize, Math.round(12 * dpr));
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+      ctx.lineWidth = Math.max(1, Math.round(1 * dpr));
+      ctx.stroke();
+
+      // 4. Bottom Controls
+      const bottomH = h - topH;
+      const centerY = topH + bottomH / 2 - Math.round(10 * dpr);
+      const btnH = Math.round(56 * dpr);
+      const maxBarW = Math.min(Math.round(w * 0.88), Math.round(384 * dpr));
+      const startX = (w - maxBarW) / 2;
+      const gap = Math.round(14 * dpr);
+      const halfW = (maxBarW - gap) / 2;
+
+      // Left button: Mic
+      const micBg = isRecordingVoice ? '#E53935' : '#E57373';
+      ctx.fillStyle = micBg;
+      ctx.beginPath();
+      ctx.roundRect(startX, centerY - btnH / 2, halfW, btnH, Math.round(20 * dpr));
+      ctx.fill();
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = `bold ${Math.round(14 * dpr)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(isRecordingVoice ? 'REC...' : 'MIC', startX + halfW / 2, centerY);
+
+      // Right button: End Call
+      ctx.fillStyle = '#E57373';
+      ctx.beginPath();
+      ctx.roundRect(startX + halfW + gap, centerY - btnH / 2, halfW, btnH, Math.round(20 * dpr));
+      ctx.fill();
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.font = `bold ${Math.round(14 * dpr)}px sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('END', startX + halfW + gap + halfW / 2, centerY);
+
+      // 5. Settings Modal if open
+      if (isSettingsOpen) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(0, 0, w, h);
+
+        const modalW = Math.min(Math.round(w * 0.88), Math.round(400 * dpr));
+        const modalH = Math.round(h * 0.7);
+        const modalX = (w - modalW) / 2;
+        const modalY = (h - modalH) / 2;
+
+        ctx.fillStyle = '#171717';
+        ctx.beginPath();
+        ctx.roundRect(modalX, modalY, modalW, modalH, Math.round(24 * dpr));
+        ctx.fill();
+        ctx.strokeStyle = '#262626';
+        ctx.lineWidth = Math.round(2 * dpr);
+        ctx.stroke();
+
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = `bold ${Math.round(16 * dpr)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('Settings', modalX + modalW / 2, modalY + Math.round(34 * dpr));
+      }
+
+      // 6. Action Feedback indicator if active
+      if (actionFeedback) {
+        const fx = Math.round(actionFeedback.x * dpr);
+        const fy = Math.round(actionFeedback.y * dpr);
+
+        if (actionFeedback.action === 'click') {
+          ctx.beginPath();
+          ctx.arc(fx, fy, Math.round(18 * dpr), 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(229, 115, 115, 0.4)';
+          ctx.fill();
+          ctx.strokeStyle = '#E57373';
+          ctx.lineWidth = Math.round(3 * dpr);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(fx, fy, Math.round(6 * dpr), 0, Math.PI * 2);
+          ctx.fillStyle = '#E57373';
+          ctx.fill();
+        } else if (actionFeedback.action === 'type') {
+          ctx.fillStyle = '#10B981';
+          ctx.beginPath();
+          ctx.arc(fx, fy, Math.round(8 * dpr), 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      return true;
+    },
+    [cameraOn, isRecordingVoice, isSettingsOpen, actionFeedback]
+  );
+
+  // Toggle optional OS-level screen share via getDisplayMedia
+  const handleToggleDeviceScreenShare = useCallback(async () => {
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach((track) => track.stop());
+      screenStreamRef.current = null;
+      if (screenVideoRef.current) screenVideoRef.current.srcObject = null;
+      setIsSharingDeviceScreen(false);
+    } else {
+      if (navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === 'function') {
+        try {
+          const stream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+            },
+          });
+          screenStreamRef.current = stream;
+          if (screenVideoRef.current) {
+            screenVideoRef.current.srcObject = stream;
+            screenVideoRef.current.play().catch(() => {});
+          }
+          setIsSharingDeviceScreen(true);
+          stream.getVideoTracks().forEach((track) => {
+            track.onended = () => {
+              screenStreamRef.current = null;
+              setIsSharingDeviceScreen(false);
+            };
+          });
+        } catch (e) {
+          console.warn('[Screen Share] Display media request cancelled or failed:', e);
+        }
+      } else {
+        alert('DisplayMedia is not supported in this browser/WebView. Viewport capture is active.');
+      }
+    }
+  }, []);
+
   // Manage call streaming lifecycle
   useEffect(() => {
     if (!inCall) {
-      setNetState({ status: 'idle', lastError: null, imgCount: 0, audioCount: 0 });
+      setNetState({
+        status: 'idle',
+        lastError: null,
+        imgCount: 0,
+        audioCount: 0,
+        screenCount: 0,
+        uiActionCount: 0,
+      });
       // Stop and clean up all media and connections
       if (abortControllerRef.current) {
         stopVoiceRecording();
@@ -479,6 +1060,14 @@ export default function App() {
       if (videoRef.current) {
         videoRef.current.srcObject = null;
       }
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((track) => track.stop());
+        screenStreamRef.current = null;
+      }
+      if (screenVideoRef.current) {
+        screenVideoRef.current.srcObject = null;
+      }
+      setIsSharingDeviceScreen(false);
       stopAudioPlayer();
       return;
     }
@@ -487,7 +1076,14 @@ export default function App() {
     abortControllerRef.current = abortController;
     const baseUrl = getBaseUrl();
 
-    setNetState({ status: 'connecting', lastError: null, imgCount: 0, audioCount: 0 });
+    setNetState({
+      status: 'connecting',
+      lastError: null,
+      imgCount: 0,
+      audioCount: 0,
+      screenCount: 0,
+      uiActionCount: 0,
+    });
     console.log(`[Stream Started] Target server base URL: ${baseUrl}`);
 
     // Initialize AudioContext on user call gesture
@@ -502,7 +1098,82 @@ export default function App() {
     // Start receiver for audio output
     startAudioReceiver(baseUrl, abortController.signal);
 
+    // Start receiver for screen UI tool actions
+    startScreenReceiver(baseUrl, abortController.signal);
+
     let frameInterval: NodeJS.Timeout | null = null;
+    let screenInterval: NodeJS.Timeout | null = null;
+
+    // Setup phone screenshot capture every 1.5s (1500 ms delay) to /v1/screen/sent
+    screenInterval = setInterval(async () => {
+      if (isSendingScreenRef.current || abortController.signal.aborted) {
+        return;
+      }
+
+      const canvas = screenCanvasRef.current || document.createElement('canvas');
+      screenCanvasRef.current = canvas;
+
+      let captured = false;
+      const screenVideo = screenVideoRef.current;
+      if (screenStreamRef.current && screenVideo && screenVideo.readyState >= 2) {
+        canvas.width = screenVideo.videoWidth || window.innerWidth * (window.devicePixelRatio || 1);
+        canvas.height = screenVideo.videoHeight || window.innerHeight * (window.devicePixelRatio || 1);
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+          captured = true;
+        }
+      }
+
+      if (!captured) {
+        captured = renderAppViewportToCanvas(canvas);
+      }
+
+      if (!captured) return;
+
+      isSendingScreenRef.current = true;
+      canvas.toBlob(
+        async (blob) => {
+          if (blob && !abortController.signal.aborted) {
+            const screenTarget = `${baseUrl}/v1/screen/sent`;
+            try {
+              const res = await fetch(screenTarget, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'image/webp',
+                  'ngrok-skip-browser-warning': '1',
+                },
+                body: blob,
+                signal: abortController.signal,
+              });
+              if (res.ok) {
+                console.log(
+                  `[Screen Sent] ${res.status} OK - ${blob.size} bytes (${canvas.width}x${canvas.height})`
+                );
+                setNetState((prev) => ({
+                  ...prev,
+                  status: 'ok',
+                  lastError: null,
+                  screenCount: prev.screenCount + 1,
+                }));
+              } else {
+                console.warn(`[Screen Sent Error] HTTP ${res.status}`);
+              }
+            } catch (err: unknown) {
+              if (!abortController.signal.aborted) {
+                console.error('[Screen Sent Failed]', (err as Error)?.message);
+              }
+            } finally {
+              isSendingScreenRef.current = false;
+            }
+          } else {
+            isSendingScreenRef.current = false;
+          }
+        },
+        'image/webp',
+        0.92
+      );
+    }, 1500);
 
     // Start video & audio media streams
     const initMedia = async () => {
@@ -613,11 +1284,30 @@ export default function App() {
 
     return () => {
       if (frameInterval) clearInterval(frameInterval);
+      if (screenInterval) clearInterval(screenInterval);
       abortController.abort();
       stopVoiceRecording();
       stopAudioPlayer();
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach((track) => track.stop());
+        screenStreamRef.current = null;
+      }
+      if (screenVideoRef.current) {
+        screenVideoRef.current.srcObject = null;
+      }
+      setIsSharingDeviceScreen(false);
     };
-  }, [inCall, getBaseUrl, cameraOn, recorderOn, startAudioReceiver, stopAudioPlayer, stopVoiceRecording]);
+  }, [
+    inCall,
+    getBaseUrl,
+    cameraOn,
+    recorderOn,
+    startAudioReceiver,
+    startScreenReceiver,
+    renderAppViewportToCanvas,
+    stopAudioPlayer,
+    stopVoiceRecording,
+  ]);
 
   // Handle cameraOn toggle on live stream
   useEffect(() => {
@@ -646,6 +1336,10 @@ export default function App() {
       <div className="h-[83%] w-full bg-black rounded-b-[40px] sm:rounded-b-[48px] shadow-[0_16px_36px_rgba(0,0,0,0.22)] relative z-10 overflow-hidden flex items-center justify-center">
         {/* Hidden canvas for 15fps WebP image capture */}
         <canvas ref={canvasRef} className="hidden" />
+
+        {/* Hidden canvas & video elements for 1.5s phone screen capture */}
+        <canvas ref={screenCanvasRef} className="hidden" />
+        <video ref={screenVideoRef} autoPlay playsInline muted className="hidden" />
 
         {/* Live camera stream */}
         {inCall && cameraOn ? (
@@ -821,6 +1515,27 @@ export default function App() {
               )}
             </div>
 
+            {/* Device Screen Share option */}
+            <div className="flex items-center justify-between p-3.5 rounded-2xl bg-neutral-800/60 border border-neutral-700/40">
+              <div className="flex flex-col">
+                <span className="text-sm font-medium text-neutral-200">Screen Capture</span>
+                <span className="text-[11px] text-neutral-400">
+                  {isSharingDeviceScreen ? 'OS DisplayMedia active' : 'Auto full-res viewport capture active'}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleToggleDeviceScreenShare}
+                className={`px-3 py-1.5 rounded-xl text-xs font-medium cursor-pointer transition-all outline-none ${
+                  isSharingDeviceScreen
+                    ? 'bg-emerald-600 text-white shadow-sm'
+                    : 'bg-neutral-700 hover:bg-neutral-600 text-neutral-200'
+                }`}
+              >
+                {isSharingDeviceScreen ? 'Stop Share' : 'Share OS Screen'}
+              </button>
+            </div>
+
             {/* Save & Check Connection Button & Status */}
             <div className="flex flex-col gap-2.5 pt-1">
               <button
@@ -885,7 +1600,7 @@ export default function App() {
                 <div className="p-3 rounded-2xl bg-neutral-800/40 border border-neutral-700/40 text-xs text-neutral-300 flex items-center justify-between">
                   <span className="text-[11px] text-neutral-400">Live Call Stats:</span>
                   <span className="font-mono text-[11px] text-neutral-200">
-                    {netState.imgCount} frames • {netState.audioCount} audio pkts
+                    {netState.imgCount} cam • {netState.screenCount} screens • {netState.audioCount} audio • {netState.uiActionCount} actions
                   </span>
                 </div>
               )}
@@ -978,6 +1693,50 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {/* Visual Feedback Overlay for AI UI actions (Click / Type / Stroll) */}
+      {actionFeedback && (
+        <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
+          {actionFeedback.action === 'click' && (
+            <div
+              className="absolute -translate-x-1/2 -translate-y-1/2 flex items-center justify-center transition-all duration-300"
+              style={{ left: actionFeedback.x, top: actionFeedback.y }}
+            >
+              <div className="w-12 h-12 rounded-full border-2 border-[#E57373] bg-[#E57373]/25 animate-ping" />
+              <div className="w-4 h-4 rounded-full bg-[#E57373] absolute shadow-lg ring-2 ring-white" />
+            </div>
+          )}
+
+          {actionFeedback.action === 'type' && (
+            <div
+              className="absolute -translate-x-1/2 -translate-y-full mb-3 flex flex-col items-center transition-all duration-200"
+              style={{ left: actionFeedback.x, top: actionFeedback.y }}
+            >
+              <div className="px-3 py-1.5 rounded-full bg-neutral-900/95 border border-neutral-700 text-xs text-neutral-100 shadow-xl backdrop-blur-xs flex items-center gap-1.5 animate-bounce">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="font-mono font-medium max-w-[200px] truncate">
+                  {actionFeedback.text ? `Type: "${actionFeedback.text}"` : 'Typing...'}
+                </span>
+              </div>
+              <div className="w-3.5 h-3.5 rounded-full bg-emerald-400 ring-2 ring-white shadow-md mt-1" />
+            </div>
+          )}
+
+          {actionFeedback.action.startsWith('stroll_') && (
+            <div
+              className="absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center transition-all duration-300"
+              style={{ left: actionFeedback.x, top: actionFeedback.y }}
+            >
+              <div className="px-3.5 py-1.5 rounded-full bg-neutral-900/95 border border-neutral-700 text-xs text-neutral-100 shadow-xl backdrop-blur-xs flex items-center gap-2 animate-pulse">
+                <span className="w-2 h-2 rounded-full bg-sky-400" />
+                <span className="capitalize font-medium">
+                  {actionFeedback.action.replace('_', ' ')}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
