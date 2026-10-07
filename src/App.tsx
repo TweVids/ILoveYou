@@ -38,11 +38,15 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
   const isSendingFrameRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Hold-to-record voice message refs and state
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const voiceRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedVoiceChunksRef = useRef<Blob[]>([]);
 
   // Incoming Opus streaming refs
   const mediaSourceRef = useRef<MediaSource | null>(null);
@@ -136,6 +140,96 @@ export default function App() {
       });
     }
   }, [provider, hostInput, endpointInput, getBaseUrl]);
+
+  // Start holding mic: record user speech
+  const startVoiceRecording = useCallback(() => {
+    if (!inCall || !recorderOn || !mediaStreamRef.current) return;
+    const audioTracks = mediaStreamRef.current.getAudioTracks();
+    if (audioTracks.length === 0 || typeof MediaRecorder === 'undefined') return;
+
+    try {
+      const audioStream = new MediaStream(audioTracks);
+      const mimeType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm'].find(
+        (type) => MediaRecorder.isTypeSupported(type)
+      ) || '';
+
+      const recorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
+      recordedVoiceChunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          recordedVoiceChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        const chunks = recordedVoiceChunksRef.current;
+        recordedVoiceChunksRef.current = [];
+        if (chunks.length === 0) return;
+
+        const voiceBlob = new Blob(chunks, { type: mimeType || 'audio/webm;codecs=opus' });
+        if (voiceBlob.size === 0) return;
+
+        const baseUrl = getBaseUrl();
+        const audioTarget = `${baseUrl}/v1/audio/sent`;
+        try {
+          console.log(`[Voice Record] Sending complete voice file: ${voiceBlob.size} bytes (${voiceBlob.type})`);
+          const res = await fetch(audioTarget, {
+            method: 'POST',
+            headers: { 'Content-Type': voiceBlob.type || 'audio/webm;codecs=opus' },
+            body: voiceBlob,
+            signal: abortControllerRef.current?.signal,
+          });
+          if (res.ok) {
+            console.log(`[Audio Sent] ${res.status} OK - whole file ${voiceBlob.size} bytes`);
+            setNetState((prev) => ({
+              ...prev,
+              status: 'ok',
+              lastError: null,
+              audioCount: prev.audioCount + 1,
+            }));
+          } else {
+            const errorMsg = `Audio HTTP ${res.status}`;
+            console.warn(`[Audio Sent Error] ${errorMsg}`);
+            setNetState((prev) => ({
+              ...prev,
+              status: 'error',
+              lastError: errorMsg,
+            }));
+          }
+        } catch (err: unknown) {
+          if (!abortControllerRef.current?.signal.aborted) {
+            const msg = (err as Error)?.message || 'Audio network error';
+            console.error('[Audio Sent Failed]', msg);
+            setNetState((prev) => ({
+              ...prev,
+              status: 'error',
+              lastError: msg.includes('Failed to fetch') ? 'Connection Failed (Check IP/CORS)' : msg,
+            }));
+          }
+        }
+      };
+
+      recorder.start();
+      voiceRecorderRef.current = recorder;
+      setIsRecordingVoice(true);
+    } catch (err) {
+      console.error('Failed to start voice recording:', err);
+    }
+  }, [inCall, recorderOn, getBaseUrl]);
+
+  // Release mic: stop recording and automatically send whole audio file
+  const stopVoiceRecording = useCallback(() => {
+    if (voiceRecorderRef.current && voiceRecorderRef.current.state === 'recording') {
+      try {
+        voiceRecorderRef.current.stop();
+      } catch {
+        // Ignore
+      }
+      voiceRecorderRef.current = null;
+    }
+    setIsRecordingVoice(false);
+  }, []);
 
   // Web Audio fallback player for individual chunks
   const playAudioChunk = useCallback(async (arrayBuffer: ArrayBuffer) => {
@@ -293,16 +387,9 @@ export default function App() {
       setNetState({ status: 'idle', lastError: null, imgCount: 0, audioCount: 0 });
       // Stop and clean up all media and connections
       if (abortControllerRef.current) {
+        stopVoiceRecording();
         abortControllerRef.current.abort();
         abortControllerRef.current = null;
-      }
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        try {
-          mediaRecorderRef.current.stop();
-        } catch {
-          // Ignore
-        }
-        mediaRecorderRef.current = null;
       }
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop());
@@ -364,62 +451,6 @@ export default function App() {
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.play().catch(() => {});
-        }
-
-        // Setup audio recording with Opus codec
-        const audioTracks = stream.getAudioTracks();
-        if (audioTracks.length > 0 && typeof MediaRecorder !== 'undefined') {
-          const audioStream = new MediaStream(audioTracks);
-          const mimeType = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/webm', 'audio/mp4'].find(
-            (type) => MediaRecorder.isTypeSupported(type)
-          ) || '';
-
-          const mediaRecorder = new MediaRecorder(audioStream, mimeType ? { mimeType } : undefined);
-          mediaRecorderRef.current = mediaRecorder;
-
-          mediaRecorder.ondataavailable = async (event) => {
-            if (event.data && event.data.size > 0 && recorderOn && !abortController.signal.aborted) {
-              const audioTarget = `${baseUrl}/v1/audio/sent`;
-              try {
-                const res = await fetch(audioTarget, {
-                  method: 'POST',
-                  headers: { 'Content-Type': event.data.type || 'audio/webm;codecs=opus' },
-                  body: event.data,
-                  signal: abortController.signal,
-                });
-                if (res.ok) {
-                  console.log(`[Audio Sent] ${res.status} OK - ${event.data.size} bytes`);
-                  setNetState((prev) => ({
-                    ...prev,
-                    status: 'ok',
-                    lastError: null,
-                    audioCount: prev.audioCount + 1,
-                  }));
-                } else {
-                  const errorMsg = `Audio HTTP ${res.status}`;
-                  console.warn(`[Audio Sent Error] ${errorMsg}`);
-                  setNetState((prev) => ({
-                    ...prev,
-                    status: 'error',
-                    lastError: errorMsg,
-                  }));
-                }
-              } catch (err: unknown) {
-                if (!abortController.signal.aborted) {
-                  const msg = (err as Error)?.message || 'Audio network error';
-                  console.error('[Audio Sent Failed]', msg);
-                  setNetState((prev) => ({
-                    ...prev,
-                    status: 'error',
-                    lastError: msg.includes('Failed to fetch') ? 'Connection Failed (Check IP/CORS)' : msg,
-                  }));
-                }
-              }
-            }
-          };
-
-          // Stream audio packets every 200ms
-          mediaRecorder.start(200);
         }
 
         // Setup video frame capture at 15 fps (every ~66.6ms) with webp compression
@@ -502,9 +533,10 @@ export default function App() {
     return () => {
       if (frameInterval) clearInterval(frameInterval);
       abortController.abort();
+      stopVoiceRecording();
       stopAudioPlayer();
     };
-  }, [inCall, getBaseUrl, cameraOn, recorderOn, startAudioReceiver, stopAudioPlayer]);
+  }, [inCall, getBaseUrl, cameraOn, recorderOn, startAudioReceiver, stopAudioPlayer, stopVoiceRecording]);
 
   // Handle cameraOn toggle on live stream
   useEffect(() => {
@@ -801,22 +833,68 @@ export default function App() {
             </svg>
           </button>
         ) : (
-          <button
-            type="button"
-            onClick={() => setInCall(false)}
-            aria-label="End call"
-            className="w-[88%] max-w-sm h-14 sm:h-16 rounded-2xl sm:rounded-3xl bg-[#E57373] hover:bg-[#e06666] active:scale-[0.98] transition-all shadow-[0_10px_25px_rgba(229,115,115,0.42),0_4px_10px_rgba(0,0,0,0.08)] active:shadow-[0_4px_12px_rgba(229,115,115,0.3)] flex items-center justify-center cursor-pointer border-none outline-none -translate-y-5"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              height="28px"
-              viewBox="0 -960 960 960"
-              width="28px"
-              fill="white"
+          <div className="w-[88%] max-w-sm flex items-center gap-3.5 -translate-y-5">
+            {/* Left half: Record / Mic Button (Hold to Record, Release to Send) */}
+            <button
+              type="button"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                try {
+                  (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+                } catch {}
+                startVoiceRecording();
+              }}
+              onPointerUp={(e) => {
+                e.preventDefault();
+                stopVoiceRecording();
+              }}
+              onPointerCancel={(e) => {
+                e.preventDefault();
+                stopVoiceRecording();
+              }}
+              onContextMenu={(e) => e.preventDefault()}
+              aria-label="Hold to record voice"
+              className={`flex-1 h-14 sm:h-16 rounded-2xl sm:rounded-3xl transition-all duration-200 flex items-center justify-center gap-2 cursor-pointer border-none outline-none select-none touch-none ${
+                isRecordingVoice
+                  ? 'bg-[#E53935] scale-[1.03] shadow-[0_12px_28px_rgba(229,57,53,0.55)] ring-4 ring-red-400/30'
+                  : 'bg-[#E57373] hover:bg-[#e06666] active:scale-[0.98] shadow-[0_10px_25px_rgba(229,115,115,0.42),0_4px_10px_rgba(0,0,0,0.08)]'
+              }`}
             >
-              <path d="m136-304-92-90q-12-12-12-28t12-28q88-95 203-142.5T480-640q118 0 232.5 47.5T916-450q12 12 12 28t-12 28l-92 90q-11 11-25.5 12t-26.5-8l-116-88q-8-6-12-14t-4-18v-114q-38-12-78-19t-82-7q-42 0-82 7t-78 19v114q0 10-4 18t-12 14l-116 88q-12 9-26.5 8T136-304Zm104-198q-29 15-56 34.5T128-424l40 40 72-56v-62Zm480 2v60l72 56 40-38q-29-26-56-45t-56-33Zm-480-2Zm480 2Z" />
-            </svg>
-          </button>
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                height="26px"
+                viewBox="0 -960 960 960"
+                width="26px"
+                fill="white"
+                className={isRecordingVoice ? 'animate-pulse' : ''}
+              >
+                <path d="M480-400q-50 0-85-35t-35-85v-240q0-50 35-85t85-35q50 0 85 35t35 85v240q0 50-35 85t-85 35Zm0-240Zm-40 520v-123q-104-14-172-93t-68-184h80q0 83 58.5 141.5T480-320q83 0 141.5-58.5T680-520h80q0 105-68 184t-172 93v123h-80Zm40-360q17 0 28.5-11.5T520-520v-240q0-17-11.5-28.5T480-800q-17 0-28.5 11.5T440-760v240q0 17 11.5 28.5T480-480Z" />
+              </svg>
+              {isRecordingVoice && (
+                <span className="text-white text-xs font-semibold tracking-wider animate-pulse uppercase">
+                  Rec...
+                </span>
+              )}
+            </button>
+
+            {/* Right half: End Call Button */}
+            <button
+              type="button"
+              onClick={() => setInCall(false)}
+              aria-label="End call"
+              className="flex-1 h-14 sm:h-16 rounded-2xl sm:rounded-3xl bg-[#E57373] hover:bg-[#e06666] active:scale-[0.98] transition-all shadow-[0_10px_25px_rgba(229,115,115,0.42),0_4px_10px_rgba(0,0,0,0.08)] active:shadow-[0_4px_12px_rgba(229,115,115,0.3)] flex items-center justify-center cursor-pointer border-none outline-none"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                height="28px"
+                viewBox="0 -960 960 960"
+                width="28px"
+                fill="white"
+              >
+                <path d="m136-304-92-90q-12-12-12-28t12-28q88-95 203-142.5T480-640q118 0 232.5 47.5T916-450q12 12 12 28t-12 28l-92 90q-11 11-25.5 12t-26.5-8l-116-88q-8-6-12-14t-4-18v-114q-38-12-78-19t-82-7q-42 0-82 7t-78 19v114q0 10-4 18t-12 14l-116 88q-12 9-26.5 8T136-304Zm104-198q-29 15-56 34.5T128-424l40 40 72-56v-62Zm480 2v60l72 56 40-38q-29-26-56-45t-56-33Zm-480-2Zm480 2Z" />
+              </svg>
+            </button>
+          </div>
         )}
       </div>
     </div>
