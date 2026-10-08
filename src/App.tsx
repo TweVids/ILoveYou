@@ -110,15 +110,18 @@ export default function App() {
     enabled: false,
     canScreenshot: false,
   });
+  const accessibilityEnabledRef = useRef(false);
 
   const checkDeviceControlStatus = useCallback(async () => {
     const DeviceControl = (window as unknown as { Capacitor?: { Plugins?: { DeviceControl?: { checkStatus: () => Promise<any> } } } }).Capacitor?.Plugins?.DeviceControl;
     if (DeviceControl && typeof DeviceControl.checkStatus === 'function') {
       try {
         const res = await DeviceControl.checkStatus();
+        const isEnabled = Boolean(res?.accessibilityEnabled);
+        accessibilityEnabledRef.current = isEnabled;
         setAccessibilityStatus({
           available: true,
-          enabled: Boolean(res?.accessibilityEnabled),
+          enabled: isEnabled,
           canScreenshot: Boolean(res?.canTakeSystemScreenshot),
         });
         return res;
@@ -599,7 +602,7 @@ export default function App() {
     const DeviceControl = (window as unknown as {
       Capacitor?: { Plugins?: { DeviceControl?: { performAction: (args: any) => Promise<any> } } };
     }).Capacitor?.Plugins?.DeviceControl;
-    if (DeviceControl && accessibilityStatus.enabled) {
+    if (DeviceControl && accessibilityEnabledRef.current) {
       DeviceControl.performAction({
         action: params.action,
         x1: params.x1,
@@ -763,28 +766,105 @@ export default function App() {
       ...prev,
       uiActionCount: prev.uiActionCount + 1,
     }));
-  }, [accessibilityStatus.enabled]);
+  }, []);
 
-  // Listen to /v2/screen/retrived and parse tool calls (perform_ui_action)
+  // Execute system-level navigation action (home_click, previous, tab)
+  const executeSystemAction = useCallback((params: { action: string }) => {
+    const rawAction = (params.action || '').toLowerCase().trim();
+    console.log(`[System Action] "${rawAction}"`, params);
+
+    const feedbackId = Date.now();
+    const width = window.innerWidth || 360;
+    const height = window.innerHeight || 640;
+
+    setActionFeedback({
+      id: feedbackId,
+      action: rawAction,
+      x: width / 2,
+      y: height - 40,
+    });
+
+    setTimeout(() => {
+      setActionFeedback((prev) => (prev && prev.id === feedbackId ? null : prev));
+    }, 1200);
+
+    // Call native Android accessibility service
+    const DeviceControl = (window as unknown as {
+      Capacitor?: { Plugins?: { DeviceControl?: { performSystemAction: (args: any) => Promise<any> } } };
+    }).Capacitor?.Plugins?.DeviceControl;
+
+    if (DeviceControl && accessibilityEnabledRef.current) {
+      DeviceControl.performSystemAction({ action: rawAction }).catch((e: unknown) => {
+        console.warn('[DeviceControl] System navigation error:', e);
+      });
+    }
+
+    // Web fallback behavior
+    if (rawAction === 'previous' || rawAction === 'back') {
+      try {
+        if (isSettingsOpen) {
+          setIsSettingsOpen(false);
+        } else {
+          window.history.back();
+        }
+      } catch {}
+    } else if (rawAction === 'home_click' || rawAction === 'home') {
+      try {
+        setIsSettingsOpen(false);
+      } catch {}
+    }
+
+    setNetState((prev) => ({
+      ...prev,
+      uiActionCount: prev.uiActionCount + 1,
+    }));
+  }, [isSettingsOpen]);
+
+  // Listen to /v2/screen/retrived and parse tool calls (perform_ui_action & perform_system_action)
   const startScreenReceiver = useCallback(
     (baseUrl: string, signal: AbortSignal) => {
       const listenEndpoint = `${baseUrl}/v2/screen/retrived`;
 
-      const parseAction = (raw: any): any => {
+      const parseAction = (raw: any): { type: 'ui' | 'system'; data: any } | null => {
         if (!raw || typeof raw !== 'object') return null;
+
+        // Check if raw is an explicit perform_system_action
+        const name = raw.name || raw.function?.name;
+        if (name === 'perform_system_action') {
+          const args = raw.parameters || raw.function?.arguments || raw.args || raw;
+          const parsed = typeof args === 'string' ? JSON.parse(args) : args;
+          if (parsed?.action) {
+            return { type: 'system', data: { action: parsed.action } };
+          }
+        }
+
+        // Direct system action payload: { action: 'home_click' | 'previous' | 'tab' }
+        if (
+          typeof raw.action === 'string' &&
+          (raw.action === 'home_click' || raw.action === 'previous' || raw.action === 'tab') &&
+          raw.x1 === undefined
+        ) {
+          return { type: 'system', data: { action: raw.action } };
+        }
+
+        // Standard perform_ui_action payload: { action, x1, y1, ... }
         if (typeof raw.action === 'string' && typeof raw.x1 === 'number' && typeof raw.y1 === 'number') {
           return {
-            action: raw.action,
-            x1: raw.x1,
-            y1: raw.y1,
-            x2: typeof raw.x2 === 'number' ? raw.x2 : undefined,
-            y2: typeof raw.y2 === 'number' ? raw.y2 : undefined,
-            scroll_speed: typeof raw.scroll_speed === 'number' ? raw.scroll_speed : 2,
-            scroll_duration_ms: typeof raw.scroll_duration_ms === 'number' ? raw.scroll_duration_ms : 400,
-            text: typeof raw.text === 'string' ? raw.text : undefined,
-            press_enter: Boolean(raw.press_enter),
+            type: 'ui',
+            data: {
+              action: raw.action,
+              x1: raw.x1,
+              y1: raw.y1,
+              x2: typeof raw.x2 === 'number' ? raw.x2 : undefined,
+              y2: typeof raw.y2 === 'number' ? raw.y2 : undefined,
+              scroll_speed: typeof raw.scroll_speed === 'number' ? raw.scroll_speed : 2,
+              scroll_duration_ms: typeof raw.scroll_duration_ms === 'number' ? raw.scroll_duration_ms : 400,
+              text: typeof raw.text === 'string' ? raw.text : undefined,
+              press_enter: Boolean(raw.press_enter),
+            },
           };
         }
+
         if (raw.parameters && typeof raw.parameters === 'object') {
           const nested = parseAction(raw.parameters);
           if (nested) return nested;
@@ -801,6 +881,9 @@ export default function App() {
                 typeof call.function.arguments === 'string'
                   ? JSON.parse(call.function.arguments)
                   : call.function.arguments;
+              if (call.function.name === 'perform_system_action' && parsedArgs?.action) {
+                return { type: 'system', data: { action: parsedArgs.action } };
+              }
               const nested = parseAction(parsedArgs);
               if (nested) return nested;
             } catch {}
@@ -811,6 +894,15 @@ export default function App() {
           if (nested) return nested;
         }
         return null;
+      };
+
+      const dispatchParsedAction = (parsed: { type: 'ui' | 'system'; data: any } | null) => {
+        if (!parsed) return;
+        if (parsed.type === 'system') {
+          executeSystemAction(parsed.data);
+        } else if (parsed.type === 'ui') {
+          executeUiAction(parsed.data);
+        }
       };
 
       const pollOrStream = async () => {
@@ -863,12 +955,10 @@ export default function App() {
                 const data = JSON.parse(jsonStr);
                 if (Array.isArray(data)) {
                   for (const item of data) {
-                    const action = parseAction(item);
-                    if (action) executeUiAction(action);
+                    dispatchParsedAction(parseAction(item));
                   }
                 } else {
-                  const action = parseAction(data);
-                  if (action) executeUiAction(action);
+                  dispatchParsedAction(parseAction(data));
                 }
               } catch {
                 // Ignore partial JSON
@@ -883,30 +973,29 @@ export default function App() {
                 jsonStr = jsonStr.replace(/^data:\s*/, '').trim();
               }
               const data = JSON.parse(jsonStr);
-              const action = parseAction(data);
-              if (action) executeUiAction(action);
+              dispatchParsedAction(parseAction(data));
             } catch {}
           }
 
-          console.warn('[Screen Receiver] Stream ended, reconnecting in 2s...');
+          // Clean close (e.g. standard HTTP response completed): reconnect immediately (50ms) to avoid queue lag
           if (!signal.aborted) {
             setTimeout(() => {
               if (!signal.aborted) pollOrStream();
-            }, 2000);
+            }, 50);
           }
         } catch (err) {
           if (!signal.aborted) {
-            console.warn('[Screen Receiver] Stream error:', err);
+            console.warn('[Screen Receiver] Stream error, retrying in 1s:', err);
             setTimeout(() => {
               if (!signal.aborted) pollOrStream();
-            }, 2000);
+            }, 1000);
           }
         }
       };
 
       pollOrStream();
     },
-    [executeUiAction]
+    [executeUiAction, executeSystemAction]
   );
 
   // Render high-fidelity full-resolution viewport canvas snapshot
@@ -1200,7 +1289,7 @@ export default function App() {
       const DeviceControl = (window as unknown as {
         Capacitor?: { Plugins?: { DeviceControl?: { captureSystemScreen: () => Promise<any> } } };
       }).Capacitor?.Plugins?.DeviceControl;
-      if (DeviceControl && accessibilityStatus.enabled) {
+      if (DeviceControl && accessibilityEnabledRef.current) {
         try {
           const sysShot = await DeviceControl.captureSystemScreen();
           if (sysShot?.success && sysShot.base64 && !abortController.signal.aborted) {
@@ -1451,7 +1540,6 @@ export default function App() {
     renderAppViewportToCanvas,
     stopAudioPlayer,
     stopVoiceRecording,
-    accessibilityStatus.enabled,
   ]);
 
   // Handle cameraOn toggle on live stream
@@ -1909,6 +1997,29 @@ export default function App() {
                 <span className="w-2 h-2 rounded-full bg-sky-400" />
                 <span className="capitalize font-medium">
                   {actionFeedback.action.replace('_', ' ')}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {(actionFeedback.action === 'home_click' ||
+            actionFeedback.action === 'home' ||
+            actionFeedback.action === 'previous' ||
+            actionFeedback.action === 'back' ||
+            actionFeedback.action === 'tab' ||
+            actionFeedback.action === 'recents') && (
+            <div
+              className="absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center transition-all duration-300"
+              style={{ left: actionFeedback.x, top: actionFeedback.y }}
+            >
+              <div className="px-4 py-2 rounded-full bg-neutral-900/95 border border-amber-500/50 text-xs text-amber-200 shadow-xl backdrop-blur-xs flex items-center gap-2 animate-bounce">
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping" />
+                <span className="font-semibold tracking-wide uppercase">
+                  OS: {actionFeedback.action === 'home_click' || actionFeedback.action === 'home'
+                    ? 'Home'
+                    : actionFeedback.action === 'previous' || actionFeedback.action === 'back'
+                    ? 'Back'
+                    : 'Recents (Tab)'}
                 </span>
               </div>
             </div>

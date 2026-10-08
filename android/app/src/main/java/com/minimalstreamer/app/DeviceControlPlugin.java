@@ -208,6 +208,37 @@ public class DeviceControlPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void performSystemAction(PluginCall call) {
+        SystemActionService service = SystemActionService.getInstance();
+        if (service == null) {
+            JSObject ret = new JSObject();
+            ret.put("success", false);
+            ret.put("error", "Accessibility service is not enabled in Android Settings");
+            call.resolve(ret);
+            return;
+        }
+
+        String action = call.getString("action", "home_click");
+        service.performSystemNavigation(action, new SystemActionService.ActionCallback() {
+            @Override
+            public void onSuccess() {
+                JSObject ret = new JSObject();
+                ret.put("success", true);
+                ret.put("action", action);
+                call.resolve(ret);
+            }
+
+            @Override
+            public void onError(String message) {
+                JSObject ret = new JSObject();
+                ret.put("success", false);
+                ret.put("error", message);
+                call.resolve(ret);
+            }
+        });
+    }
+
+    @PluginMethod
     public void captureSystemScreen(PluginCall call) {
         SystemActionService service = SystemActionService.getInstance();
         if (service == null) {
@@ -238,3 +269,4 @@ public class DeviceControlPlugin extends Plugin {
         });
     }
 }
+

@@ -200,6 +200,38 @@ public class SystemActionService extends AccessibilityService {
         }
     }
 
+    /**
+     * Performs system-level hardware button actions (Home, Back, Recents)
+     */
+    public void performSystemNavigation(String action, final ActionCallback callback) {
+        try {
+            int globalAction = -1;
+            if ("home_click".equalsIgnoreCase(action) || "home".equalsIgnoreCase(action)) {
+                globalAction = GLOBAL_ACTION_HOME;
+            } else if ("previous".equalsIgnoreCase(action) || "back".equalsIgnoreCase(action)) {
+                globalAction = GLOBAL_ACTION_BACK;
+            } else if ("tab".equalsIgnoreCase(action) || "recents".equalsIgnoreCase(action)) {
+                globalAction = GLOBAL_ACTION_RECENTS;
+            }
+
+            if (globalAction == -1) {
+                if (callback != null) callback.onError("Unknown system navigation action: " + action);
+                return;
+            }
+
+            boolean success = performGlobalAction(globalAction);
+            Log.i(TAG, "performGlobalAction " + action + " result: " + success);
+            if (success) {
+                if (callback != null) callback.onSuccess();
+            } else {
+                if (callback != null) callback.onError("System action failed to execute: " + action);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error executing system navigation action", e);
+            if (callback != null) callback.onError(e.getMessage());
+        }
+    }
+
     private AccessibilityNodeInfo findEditableNode(AccessibilityNodeInfo node) {
         if (node == null) return null;
         if (node.isEditable() || (node.getClassName() != null && node.getClassName().toString().contains("EditText"))) {
