@@ -259,6 +259,236 @@ public class SystemActionService extends AccessibilityService {
     }
 
     /**
+     * Launch an intent action directly (YouTube, Zalo, Phone Call, Web Search, App)
+     */
+    public void launchIntentAction(String target, String query, String phoneNumber, String url, String packageName, final ActionCallback callback) {
+        try {
+            Context ctx = getApplicationContext();
+            String t = target != null ? target.toLowerCase().trim() : "";
+            android.content.Intent intent = null;
+
+            if ("youtube".equals(t)) {
+                if (query != null && !query.trim().isEmpty()) {
+                    intent = new android.content.Intent(android.content.Intent.ACTION_SEARCH);
+                    intent.setPackage("com.google.android.youtube");
+                    intent.putExtra("query", query.trim());
+                    intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                } else {
+                    intent = ctx.getPackageManager().getLaunchIntentForPackage("com.google.android.youtube");
+                }
+                if (intent == null && query != null && !query.trim().isEmpty()) {
+                    // Fallback to web search on youtube
+                    intent = new android.content.Intent(android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse("https://www.youtube.com/results?search_query=" + android.net.Uri.encode(query.trim())));
+                    intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                }
+            } else if ("zalo".equals(t)) {
+                if (phoneNumber != null && !phoneNumber.trim().isEmpty()) {
+                    String cleanPhone = phoneNumber.replaceAll("[^0-9+]", "");
+                    intent = new android.content.Intent(android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse("https://zalo.me/" + cleanPhone));
+                    intent.setPackage("com.zing.zalo");
+                    intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                }
+                if (intent == null || ctx.getPackageManager().resolveActivity(intent, 0) == null) {
+                    intent = ctx.getPackageManager().getLaunchIntentForPackage("com.zing.zalo");
+                }
+            } else if ("phone_call".equals(t) || "call".equals(t)) {
+                String cleanPhone = (phoneNumber != null ? phoneNumber : (query != null ? query : "")).replaceAll("[^0-9+*#]", "");
+                intent = new android.content.Intent(android.content.Intent.ACTION_DIAL,
+                        android.net.Uri.parse("tel:" + cleanPhone));
+                intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            } else if ("web_search".equals(t) || "search".equals(t)) {
+                String q = query != null ? query.trim() : "";
+                intent = new android.content.Intent(android.content.Intent.ACTION_WEB_SEARCH);
+                intent.putExtra(android.app.SearchManager.QUERY, q);
+                intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            } else if ("browser".equals(t) || "url".equals(t)) {
+                String targetUrl = url != null ? url.trim() : (query != null ? query.trim() : "https://google.com");
+                if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+                    targetUrl = "https://" + targetUrl;
+                }
+                intent = new android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(targetUrl));
+                intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            } else if ("app".equals(t)) {
+                String pkg = packageName != null && !packageName.trim().isEmpty() ? packageName.trim() : null;
+                if (pkg == null && query != null && !query.trim().isEmpty()) {
+                    String qLower = query.toLowerCase().trim();
+                    if (qLower.contains("zalo")) pkg = "com.zing.zalo";
+                    else if (qLower.contains("youtube")) pkg = "com.google.android.youtube";
+                    else if (qLower.contains("spotify")) pkg = "com.spotify.music";
+                    else if (qLower.contains("chrome")) pkg = "com.android.chrome";
+                    else if (qLower.contains("map")) pkg = "com.google.android.apps.maps";
+                    else if (qLower.contains("camera")) pkg = "com.android.camera";
+                    else if (qLower.contains("facebook")) pkg = "com.facebook.katana";
+                    else if (qLower.contains("tiktok")) pkg = "com.zhiliaoapp.musically";
+                }
+                if (pkg != null) {
+                    intent = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
+                }
+            }
+
+            if (intent != null) {
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(intent);
+                Log.i(TAG, "Launched intent for target: " + target);
+                if (callback != null) callback.onSuccess();
+            } else {
+                if (callback != null) callback.onError("Could not create intent for target: " + target);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed launching intent for target: " + target, e);
+            if (callback != null) callback.onError(e.getMessage());
+        }
+    }
+
+    public interface ElementActionResultCallback {
+        void onSuccess(String resultMessage);
+        void onError(String message);
+    }
+
+    /**
+     * Interact with UI elements semantically (click by text/desc, type into element, read screen)
+     */
+    public void performElementAction(String action, String targetText, String textToType, boolean pressEnter, final ElementActionResultCallback callback) {
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root == null) {
+                if (callback != null) callback.onError("Active window not accessible");
+                return;
+            }
+
+            String act = action != null ? action.toLowerCase().trim() : "click";
+
+            if ("read_screen".equals(act)) {
+                StringBuilder sb = new StringBuilder();
+                collectAllText(root, sb, 0);
+                String result = sb.toString().trim();
+                if (callback != null) callback.onSuccess(result.isEmpty() ? "(No readable text on current screen)" : result);
+                return;
+            }
+
+            if (targetText == null || targetText.trim().isEmpty()) {
+                if (callback != null) callback.onError("target_text is required for action: " + act);
+                return;
+            }
+
+            AccessibilityNodeInfo targetNode = findNodeByTextOrDesc(root, targetText.trim());
+
+            if (targetNode == null) {
+                if (callback != null) callback.onError("Could not find element matching text/desc: \"" + targetText + "\"");
+                return;
+            }
+
+            if ("click".equals(act)) {
+                // Find nearest clickable ancestor or self
+                AccessibilityNodeInfo clickable = findClickableAncestorOrSelf(targetNode);
+                boolean clicked = clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                if (!clicked) {
+                    // Try click on target node directly
+                    clicked = targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                }
+                if (clicked) {
+                    if (callback != null) callback.onSuccess("Successfully clicked element: \"" + targetText + "\"");
+                } else {
+                    if (callback != null) callback.onError("Failed to execute click action on: \"" + targetText + "\"");
+                }
+            } else if ("type".equals(act)) {
+                AccessibilityNodeInfo editable = targetNode.isEditable() ? targetNode : findEditableNode(targetNode);
+                if (editable == null) {
+                    editable = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                }
+                if (editable == null) {
+                    editable = findEditableNode(root);
+                }
+
+                String text = textToType != null ? textToType : "";
+                boolean typed = false;
+                if (editable != null) {
+                    Bundle args = new Bundle();
+                    args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
+                    typed = editable.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+                    if (!typed) {
+                        copyToClipboard(text);
+                        typed = editable.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+                    }
+                    if (pressEnter) {
+                        editable.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                    }
+                }
+
+                if (!typed) {
+                    copyToClipboard(text);
+                }
+
+                if (callback != null) callback.onSuccess("Typed text into element: \"" + targetText + "\"");
+            } else {
+                if (callback != null) callback.onError("Unsupported element action: " + act);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error in performElementAction", e);
+            if (callback != null) callback.onError(e.getMessage());
+        }
+    }
+
+    private AccessibilityNodeInfo findNodeByTextOrDesc(AccessibilityNodeInfo root, String query) {
+        if (root == null || query == null) return null;
+        String q = query.toLowerCase();
+
+        CharSequence text = root.getText();
+        if (text != null && text.toString().toLowerCase().contains(q)) {
+            return root;
+        }
+
+        CharSequence desc = root.getContentDescription();
+        if (desc != null && desc.toString().toLowerCase().contains(q)) {
+            return root;
+        }
+
+        int count = root.getChildCount();
+        for (int i = 0; i < count; i++) {
+            AccessibilityNodeInfo child = root.getChild(i);
+            if (child != null) {
+                AccessibilityNodeInfo match = findNodeByTextOrDesc(child, query);
+                if (match != null) return match;
+            }
+        }
+        return null;
+    }
+
+    private AccessibilityNodeInfo findClickableAncestorOrSelf(AccessibilityNodeInfo node) {
+        AccessibilityNodeInfo current = node;
+        while (current != null) {
+            if (current.isClickable()) {
+                return current;
+            }
+            current = current.getParent();
+        }
+        return node;
+    }
+
+    private void collectAllText(AccessibilityNodeInfo node, StringBuilder sb, int depth) {
+        if (node == null || depth > 30) return;
+
+        CharSequence text = node.getText();
+        CharSequence desc = node.getContentDescription();
+
+        if (text != null && !text.toString().trim().isEmpty()) {
+            sb.append(text.toString().trim()).append("\n");
+        } else if (desc != null && !desc.toString().trim().isEmpty()) {
+            sb.append("[").append(desc.toString().trim()).append("]\n");
+        }
+
+        int count = node.getChildCount();
+        for (int i = 0; i < count; i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                collectAllText(child, sb, depth + 1);
+            }
+        }
+    }
+
+    /**
      * Capture full-screen system screenshot on Android 11+ (API 30+)
      */
     public void takeSystemScreenshot(final ScreenshotCallback callback) {

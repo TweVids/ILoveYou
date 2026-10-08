@@ -239,6 +239,77 @@ public class DeviceControlPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void launchIntent(PluginCall call) {
+        SystemActionService service = SystemActionService.getInstance();
+        if (service == null) {
+            JSObject ret = new JSObject();
+            ret.put("success", false);
+            ret.put("error", "Accessibility service is not enabled");
+            call.resolve(ret);
+            return;
+        }
+
+        String target = call.getString("target", "");
+        String query = call.getString("query", "");
+        String phoneNumber = call.getString("phone_number", "");
+        String url = call.getString("url", "");
+        String packageName = call.getString("package_name", "");
+
+        service.launchIntentAction(target, query, phoneNumber, url, packageName, new SystemActionService.ActionCallback() {
+            @Override
+            public void onSuccess() {
+                JSObject ret = new JSObject();
+                ret.put("success", true);
+                ret.put("target", target);
+                call.resolve(ret);
+            }
+
+            @Override
+            public void onError(String message) {
+                JSObject ret = new JSObject();
+                ret.put("success", false);
+                ret.put("error", message);
+                call.resolve(ret);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void performElementAction(PluginCall call) {
+        SystemActionService service = SystemActionService.getInstance();
+        if (service == null) {
+            JSObject ret = new JSObject();
+            ret.put("success", false);
+            ret.put("error", "Accessibility service is not enabled");
+            call.resolve(ret);
+            return;
+        }
+
+        String action = call.getString("action", "click");
+        String targetText = call.getString("target_text", "");
+        String textToType = call.getString("text_to_type", "");
+        boolean pressEnter = Boolean.TRUE.equals(call.getBoolean("press_enter", false));
+
+        service.performElementAction(action, targetText, textToType, pressEnter, new SystemActionService.ElementActionResultCallback() {
+            @Override
+            public void onSuccess(String resultMessage) {
+                JSObject ret = new JSObject();
+                ret.put("success", true);
+                ret.put("result", resultMessage);
+                call.resolve(ret);
+            }
+
+            @Override
+            public void onError(String message) {
+                JSObject ret = new JSObject();
+                ret.put("success", false);
+                ret.put("error", message);
+                call.resolve(ret);
+            }
+        });
+    }
+
+    @PluginMethod
     public void captureSystemScreen(PluginCall call) {
         SystemActionService service = SystemActionService.getInstance();
         if (service == null) {

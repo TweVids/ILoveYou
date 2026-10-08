@@ -820,16 +820,155 @@ export default function App() {
     }));
   }, [isSettingsOpen]);
 
+  // Execute direct intent action (YouTube, Zalo, Phone Call, Web Search, App)
+  const executeIntentAction = useCallback((params: {
+    target: string;
+    query?: string;
+    phone_number?: string;
+    url?: string;
+    package_name?: string;
+  }) => {
+    const rawTarget = (params.target || '').toLowerCase().trim();
+    console.log(`[Intent Action] "${rawTarget}"`, params);
+
+    const feedbackId = Date.now();
+    const width = window.innerWidth || 360;
+    const height = window.innerHeight || 640;
+
+    setActionFeedback({
+      id: feedbackId,
+      action: `intent:${rawTarget}`,
+      x: width / 2,
+      y: height / 2,
+      text: params.query || params.phone_number || params.url,
+    });
+
+    setTimeout(() => {
+      setActionFeedback((prev) => (prev && prev.id === feedbackId ? null : prev));
+    }, 1500);
+
+    // Call native Android plugin
+    const DeviceControl = (window as unknown as {
+      Capacitor?: { Plugins?: { DeviceControl?: { launchIntent: (args: any) => Promise<any> } } };
+    }).Capacitor?.Plugins?.DeviceControl;
+
+    if (DeviceControl && accessibilityEnabledRef.current) {
+      DeviceControl.launchIntent(params).catch((e: unknown) => {
+        console.warn('[DeviceControl] Launch intent error:', e);
+      });
+    }
+
+    // Web fallback
+    if (rawTarget === 'web_search' && params.query) {
+      window.open(`https://www.google.com/search?q=${encodeURIComponent(params.query)}`, '_blank');
+    } else if (rawTarget === 'youtube' && params.query) {
+      window.open(`https://www.youtube.com/results?search_query=${encodeURIComponent(params.query)}`, '_blank');
+    } else if (rawTarget === 'phone_call' && params.phone_number) {
+      window.location.href = `tel:${params.phone_number}`;
+    } else if (rawTarget === 'browser' && params.url) {
+      window.open(params.url, '_blank');
+    }
+
+    setNetState((prev) => ({
+      ...prev,
+      uiActionCount: prev.uiActionCount + 1,
+    }));
+  }, []);
+
+  // Execute semantic UI element action (click by text/desc, type into element, read screen)
+  const executeElementAction = useCallback((params: {
+    action: string;
+    target_text?: string;
+    text_to_type?: string;
+    press_enter?: boolean;
+  }) => {
+    const act = (params.action || 'click').toLowerCase().trim();
+    console.log(`[Element Action] "${act}" target: "${params.target_text}"`, params);
+
+    const feedbackId = Date.now();
+    const width = window.innerWidth || 360;
+    const height = window.innerHeight || 640;
+
+    setActionFeedback({
+      id: feedbackId,
+      action: `element:${act}`,
+      x: width / 2,
+      y: height / 3,
+      text: params.target_text || params.text_to_type,
+    });
+
+    setTimeout(() => {
+      setActionFeedback((prev) => (prev && prev.id === feedbackId ? null : prev));
+    }, 1500);
+
+    // Call native Android plugin
+    const DeviceControl = (window as unknown as {
+      Capacitor?: { Plugins?: { DeviceControl?: { performElementAction: (args: any) => Promise<any> } } };
+    }).Capacitor?.Plugins?.DeviceControl;
+
+    if (DeviceControl && accessibilityEnabledRef.current) {
+      DeviceControl.performElementAction(params).then((res: any) => {
+        console.log('[DeviceControl] Element action result:', res);
+      }).catch((e: unknown) => {
+        console.warn('[DeviceControl] Element action error:', e);
+      });
+    }
+
+    // Web fallback for clicking elements by text
+    if (act === 'click' && params.target_text) {
+      const q = params.target_text.toLowerCase();
+      const allElements = Array.from(document.querySelectorAll('button, a, [role="button"], span, p, label'));
+      const match = allElements.find((el) => el.textContent?.toLowerCase().includes(q)) as HTMLElement | undefined;
+      if (match) {
+        try { match.click(); } catch {}
+      }
+    }
+
+    setNetState((prev) => ({
+      ...prev,
+      uiActionCount: prev.uiActionCount + 1,
+    }));
+  }, []);
+
   // Listen to /v2/screen/retrived and parse tool calls (perform_ui_action & perform_system_action)
   const startScreenReceiver = useCallback(
     (baseUrl: string, signal: AbortSignal) => {
       const listenEndpoint = `${baseUrl}/v2/screen/retrived`;
 
-      const parseAction = (raw: any): { type: 'ui' | 'system'; data: any } | null => {
+      const parseAction = (raw: any): { type: 'ui' | 'system' | 'intent' | 'element'; data: any } | null => {
         if (!raw || typeof raw !== 'object') return null;
 
-        // Check if raw is an explicit perform_system_action
         const name = raw.name || raw.function?.name;
+
+        // 1. Explicit launch_intent
+        if (name === 'launch_intent') {
+          const args = raw.parameters || raw.function?.arguments || raw.args || raw;
+          const parsed = typeof args === 'string' ? JSON.parse(args) : args;
+          if (parsed?.target) {
+            return { type: 'intent', data: parsed };
+          }
+        }
+
+        // Direct target payload for intent: { target: 'youtube' | 'zalo' | 'phone_call' | ... }
+        if (typeof raw.target === 'string' && (raw.target === 'youtube' || raw.target === 'zalo' || raw.target === 'phone_call' || raw.target === 'web_search' || raw.target === 'browser' || raw.target === 'app')) {
+          return { type: 'intent', data: raw };
+        }
+
+        // 2. Explicit ui_element_action
+        if (name === 'ui_element_action') {
+          const args = raw.parameters || raw.function?.arguments || raw.args || raw;
+          const parsed = typeof args === 'string' ? JSON.parse(args) : args;
+          if (parsed?.action) {
+            return { type: 'element', data: parsed };
+          }
+        }
+
+        // Direct element action payload: { action: 'click' | 'type' | 'read_screen', target_text: ... }
+        if (typeof raw.action === 'string' && (raw.target_text !== undefined || raw.action === 'read_screen') && raw.x1 === undefined) {
+          return { type: 'element', data: raw };
+        }
+
+        // 3. Explicit perform_system_action
         if (name === 'perform_system_action') {
           const args = raw.parameters || raw.function?.arguments || raw.args || raw;
           const parsed = typeof args === 'string' ? JSON.parse(args) : args;
@@ -847,7 +986,7 @@ export default function App() {
           return { type: 'system', data: { action: raw.action } };
         }
 
-        // Standard perform_ui_action payload: { action, x1, y1, ... }
+        // 4. Standard perform_ui_action payload: { action, x1, y1, ... }
         if (typeof raw.action === 'string' && typeof raw.x1 === 'number' && typeof raw.y1 === 'number') {
           return {
             type: 'ui',
@@ -881,6 +1020,12 @@ export default function App() {
                 typeof call.function.arguments === 'string'
                   ? JSON.parse(call.function.arguments)
                   : call.function.arguments;
+              if (call.function.name === 'launch_intent' && parsedArgs?.target) {
+                return { type: 'intent', data: parsedArgs };
+              }
+              if (call.function.name === 'ui_element_action' && parsedArgs?.action) {
+                return { type: 'element', data: parsedArgs };
+              }
               if (call.function.name === 'perform_system_action' && parsedArgs?.action) {
                 return { type: 'system', data: { action: parsedArgs.action } };
               }
@@ -896,9 +1041,13 @@ export default function App() {
         return null;
       };
 
-      const dispatchParsedAction = (parsed: { type: 'ui' | 'system'; data: any } | null) => {
+      const dispatchParsedAction = (parsed: { type: 'ui' | 'system' | 'intent' | 'element'; data: any } | null) => {
         if (!parsed) return;
-        if (parsed.type === 'system') {
+        if (parsed.type === 'intent') {
+          executeIntentAction(parsed.data);
+        } else if (parsed.type === 'element') {
+          executeElementAction(parsed.data);
+        } else if (parsed.type === 'system') {
           executeSystemAction(parsed.data);
         } else if (parsed.type === 'ui') {
           executeUiAction(parsed.data);
@@ -995,7 +1144,7 @@ export default function App() {
 
       pollOrStream();
     },
-    [executeUiAction, executeSystemAction]
+    [executeUiAction, executeSystemAction, executeIntentAction, executeElementAction]
   );
 
   // Render high-fidelity full-resolution viewport canvas snapshot
@@ -2020,6 +2169,35 @@ export default function App() {
                     : actionFeedback.action === 'previous' || actionFeedback.action === 'back'
                     ? 'Back'
                     : 'Recents (Tab)'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {actionFeedback.action.startsWith('intent:') && (
+            <div
+              className="absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center transition-all duration-300"
+              style={{ left: actionFeedback.x, top: actionFeedback.y }}
+            >
+              <div className="px-4 py-2 rounded-full bg-neutral-900/95 border border-violet-500/50 text-xs text-violet-200 shadow-xl backdrop-blur-xs flex items-center gap-2 animate-bounce">
+                <span className="w-2.5 h-2.5 rounded-full bg-violet-400 animate-ping" />
+                <span className="font-semibold tracking-wide capitalize">
+                  Intent: {actionFeedback.action.replace('intent:', '').replace('_', ' ')}
+                  {actionFeedback.text ? ` ("${actionFeedback.text}")` : ''}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {actionFeedback.action.startsWith('element:') && (
+            <div
+              className="absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center justify-center transition-all duration-300"
+              style={{ left: actionFeedback.x, top: actionFeedback.y }}
+            >
+              <div className="px-4 py-2 rounded-full bg-neutral-900/95 border border-emerald-500/50 text-xs text-emerald-200 shadow-xl backdrop-blur-xs flex items-center gap-2 animate-bounce">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="font-semibold tracking-wide capitalize">
+                  UI: {actionFeedback.action.replace('element:', '')} {actionFeedback.text ? `("${actionFeedback.text}")` : ''}
                 </span>
               </div>
             </div>
