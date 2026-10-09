@@ -185,10 +185,35 @@ export default function App() {
     }
   }, []);
 
+  // NEW: explicitly stop the always-on background service.
+  const handleStopSystemControl = useCallback(async () => {
+    const DeviceControl = (window as unknown as { Capacitor?: { Plugins?: { DeviceControl?: { stopService?: () => Promise<any> } } } }).Capacitor?.Plugins?.DeviceControl;
+    if (DeviceControl && typeof DeviceControl.stopService === 'function') {
+      try {
+        await DeviceControl.stopService();
+      } catch (e) {
+        console.warn('[DeviceControl] Failed stopping service:', e);
+      }
+    }
+  }, []);
+
   // Poll accessibility status on mount and when settings open
   useEffect(() => {
     checkDeviceControlStatus();
   }, [checkDeviceControlStatus, isSettingsOpen]);
+
+  // NEW: refresh accessibility status when the app regains focus (e.g. after
+  // the user toggles Accessibility in Android Settings and comes back).
+  useEffect(() => {
+    const refresh = () => { checkDeviceControlStatus(); };
+    const onVis = () => { if (!document.hidden) refresh(); };
+    document.addEventListener('visibilitychange', onVis);
+    window.addEventListener('focus', refresh);
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      window.removeEventListener('focus', refresh);
+    };
+  }, [checkDeviceControlStatus]);
 
   // Compute base URL for current provider
   const getBaseUrl = useCallback(() => {
@@ -1199,6 +1224,49 @@ export default function App() {
     [executeUiAction, executeSystemAction, executeIntentAction, executeElementAction]
   );
 
+  // =========================================================================
+  // FIX (bug #2): Always-on receivers — decoupled from `inCall`.
+  //
+  // The command channel that delivers launch_intent / perform_* to the app was
+  // previously opened only while a call was active. That's why the AI could
+  // only control the device (open apps, click, type) during a call. We now
+  // wire them up here, on mount, independent of call state.
+  // =========================================================================
+
+  // Always-on JS-side command receiver. On Android the native foreground
+  // service owns the SSE stream, so we only start the JS receiver when the
+  // native plugin is missing (web / PWA). This avoids double-dispatching.
+  useEffect(() => {
+    const hasNative = Boolean(
+      (window as unknown as { Capacitor?: { Plugins?: { DeviceControl?: { startService?: unknown } } } })
+        .Capacitor?.Plugins?.DeviceControl?.startService
+    );
+    if (hasNative) {
+      console.log('[Always-On Receiver] Native DeviceControl present — native SSE owns the command stream.');
+      return;
+    }
+    const abort = new AbortController();
+    const baseUrl = getBaseUrlRef.current();
+    console.log(`[Always-On Receiver] Starting JS SSE receiver at ${baseUrl}`);
+    startScreenReceiver(baseUrl, abort.signal);
+    return () => abort.abort();
+  }, [startScreenReceiver, provider, hostInput, endpointInput]);
+
+  // Always-on native foreground service. Starts whenever accessibility is
+  // enabled and (re)starts if the base URL settings change.
+  useEffect(() => {
+    if (!accessibilityStatus.enabled) return;
+    const DeviceControl = (window as unknown as {
+      Capacitor?: { Plugins?: { DeviceControl?: { startService?: (args: { baseUrl: string }) => Promise<any> } } };
+    }).Capacitor?.Plugins?.DeviceControl;
+    if (!DeviceControl?.startService) return;
+
+    const baseUrl = getBaseUrlRef.current();
+    DeviceControl.startService({ baseUrl }).catch((e: unknown) => {
+      console.warn('[NativeService] Always-on start failed:', e);
+    });
+  }, [accessibilityStatus.enabled, provider, hostInput, endpointInput]);
+
   // Render high-fidelity full-resolution viewport canvas snapshot
   const renderAppViewportToCanvas = useCallback(
     (canvas: HTMLCanvasElement): boolean => {
@@ -1428,14 +1496,9 @@ export default function App() {
       setIsSharingDeviceScreen(false);
       stopAudioPlayer();
 
-      // Stop native Android streaming foreground service
-      const DeviceControl = (window as unknown as {
-        Capacitor?: { Plugins?: { DeviceControl?: { stopService?: () => Promise<any> } } };
-      }).Capacitor?.Plugins?.DeviceControl;
-      if (DeviceControl && typeof DeviceControl.stopService === 'function') {
-        DeviceControl.stopService().catch(() => {});
-      }
-
+      // NOTE: We deliberately DO NOT stop the native foreground service here.
+      // It is now always-on (see the "Always-on native foreground service"
+      // effect above), so the AI can control the device outside of calls.
       return;
     }
 
@@ -1443,15 +1506,15 @@ export default function App() {
     abortControllerRef.current = abortController;
     const baseUrl = getBaseUrlRef.current();
 
-    // Start native Android foreground service (handles screen capture, uploads, SSE action stream, and dispatching natively)
-    const DeviceControl = (window as unknown as {
-      Capacitor?: { Plugins?: { DeviceControl?: { startService?: (args: { baseUrl: string }) => Promise<any> } } };
-    }).Capacitor?.Plugins?.DeviceControl;
-    if (DeviceControl && typeof DeviceControl.startService === 'function') {
-      DeviceControl.startService({ baseUrl }).catch((e: unknown) => {
-        console.warn('[NativeService] Start failed:', e);
-      });
-    }
+    // FIX (bug #1): `frameInterval` must be declared in this scope. Previously
+    // it was assigned without a declaration, which threw a ReferenceError in
+    // strict mode — both inside initMedia() (silently swallowed by the
+    // surrounding try/catch) and, more importantly, during the cleanup, which
+    // tore down the React tree on End Call and left only the pastel background.
+    let frameInterval: ReturnType<typeof setInterval> | undefined;
+
+    // NOTE: Native service is started by the always-on effect above when
+    // accessibility is enabled. We intentionally do NOT start/stop it here.
 
     setNetState({
       status: 'connecting',
@@ -1461,7 +1524,7 @@ export default function App() {
       screenCount: 0,
       uiActionCount: 0,
     });
-    console.log(`[Stream Started] Target server base URL: ${baseUrl} (Native foreground service running)`);
+    console.log(`[Stream Started] Target server base URL: ${baseUrl}`);
 
     // Initialize AudioContext on user call gesture
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -1603,28 +1666,26 @@ export default function App() {
 
     initMedia();
 
+    // FIX (bug #1 continued): every teardown step is now wrapped so a single
+    // failure can't short-circuit the rest of the cleanup (which is what
+    // produced the "background-only" screen on End Call).
     return () => {
-      clearInterval(statsInterval);
-      if (frameInterval) clearInterval(frameInterval);
-      abortController.abort();
-      stopVoiceRecording();
-      stopAudioPlayer();
-      if (screenStreamRef.current) {
-        screenStreamRef.current.getTracks().forEach((track) => track.stop());
-        screenStreamRef.current = null;
-      }
-      if (screenVideoRef.current) {
-        screenVideoRef.current.srcObject = null;
-      }
-      setIsSharingDeviceScreen(false);
-
-      // Stop native Android streaming service
-      const DeviceControl = (window as unknown as {
-        Capacitor?: { Plugins?: { DeviceControl?: { stopService?: () => Promise<any> } } };
-      }).Capacitor?.Plugins?.DeviceControl;
-      if (DeviceControl && typeof DeviceControl.stopService === 'function') {
-        DeviceControl.stopService().catch(() => {});
-      }
+      try { clearInterval(statsInterval); } catch {}
+      try { if (frameInterval) clearInterval(frameInterval); } catch {}
+      try { abortController.abort(); } catch {}
+      try { stopVoiceRecording(); } catch {}
+      try { stopAudioPlayer(); } catch {}
+      try {
+        if (screenStreamRef.current) {
+          screenStreamRef.current.getTracks().forEach((track) => track.stop());
+          screenStreamRef.current = null;
+        }
+        if (screenVideoRef.current) {
+          screenVideoRef.current.srcObject = null;
+        }
+        setIsSharingDeviceScreen(false);
+      } catch {}
+      // REMOVED: DeviceControl.stopService() — the service is always-on now.
     };
   }, [
     inCall,
@@ -1871,15 +1932,15 @@ export default function App() {
                       : 'bg-neutral-850 text-neutral-400 border border-neutral-700'
                   }`}
                 >
-                  {accessibilityStatus.enabled ? 'Enabled' : 'In-App Only'}
+                  {accessibilityStatus.enabled ? 'Always-On' : 'In-App Only'}
                 </span>
               </div>
               <p className="text-[11px] text-neutral-400 leading-normal">
                 {accessibilityStatus.enabled
-                  ? 'AI assistant has permission to click, scroll, and type across all apps on this phone.'
-                  : 'Enable Android Accessibility to allow the AI assistant to click, scroll, and type outside this app across the entire device.'}
+                  ? 'AI assistant is running in the background and can click, scroll, and type across all apps — even when no call is active.'
+                  : 'Enable Android Accessibility to allow the AI assistant to click, scroll, and type outside this app across the entire device, at any time.'}
               </p>
-              {!accessibilityStatus.enabled && (
+              {!accessibilityStatus.enabled ? (
                 <button
                   type="button"
                   onClick={handleOpenAccessibilitySettings}
@@ -1889,6 +1950,14 @@ export default function App() {
                     <path d="M480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm0-80q134 0 227-93t93-227q0-134-93-227t-227-93q-134 0-227 93t-93 227q0 134 93 227t227 93Zm0-320Z"/>
                   </svg>
                   <span>Enable System Control</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleStopSystemControl}
+                  className="mt-1 w-full py-2 px-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-xs font-medium text-neutral-300 hover:text-white transition-all flex items-center justify-center gap-1.5 cursor-pointer outline-none"
+                >
+                  <span>Disable Background Assistant</span>
                 </button>
               )}
             </div>
