@@ -71,11 +71,7 @@ export default function App() {
   const voiceRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedVoiceChunksRef = useRef<Blob[]>([]);
 
-  // Incoming Opus streaming refs
-  const mediaSourceRef = useRef<MediaSource | null>(null);
-  const sourceBufferRef = useRef<SourceBuffer | null>(null);
-  const audioElemRef = useRef<HTMLAudioElement | null>(null);
-  const chunkQueueRef = useRef<Uint8Array[]>([]);
+  // Incoming audio is raw PCM (24 kHz mono int16) scheduled via WebAudio.
 
   // Screen capture & tool action refs
   const screenCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -369,47 +365,8 @@ export default function App() {
     setIsRecordingVoice(false);
   }, []);
 
-  // Web Audio fallback player for individual chunks
-  const playAudioChunk = useCallback(async (arrayBuffer: ArrayBuffer) => {
-    if (!audioContextRef.current) {
-      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      audioContextRef.current = new AudioCtx();
-    }
-    const ctx = audioContextRef.current;
-    if (ctx.state === 'suspended') {
-      await ctx.resume();
-    }
-
-    try {
-      const audioBuffer = await ctx.decodeAudioData(arrayBuffer.slice(0));
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(ctx.destination);
-
-      const currentTime = ctx.currentTime;
-      const startTime = Math.max(currentTime, nextPlayTimeRef.current);
-      source.start(startTime);
-      nextPlayTimeRef.current = startTime + audioBuffer.duration;
-    } catch {
-      // Ignore individual decode errors
-    }
-  }, []);
-
-  // Stop incoming audio player cleanly
+  // Stop incoming audio playback cleanly
   const stopAudioPlayer = useCallback(() => {
-    if (audioElemRef.current) {
-      audioElemRef.current.pause();
-      audioElemRef.current.removeAttribute('src');
-      audioElemRef.current.load();
-      if (audioElemRef.current.parentNode) {
-        audioElemRef.current.parentNode.removeChild(audioElemRef.current);
-      }
-      audioElemRef.current = null;
-    }
-    sourceBufferRef.current = null;
-    mediaSourceRef.current = null;
-    chunkQueueRef.current = [];
-
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
@@ -417,7 +374,7 @@ export default function App() {
     nextPlayTimeRef.current = 0;
   }, []);
 
-  // Listen to /v2/audio/retrived and play Opus stream in real-time queue
+  // Listen to /v2/audio/retrived and play the raw PCM stream in real-time
   const startAudioReceiver = useCallback((baseUrl: string, signal: AbortSignal) => {
     const listenEndpoint = `${baseUrl}/v2/audio/retrived`;
 
@@ -427,131 +384,37 @@ export default function App() {
         const response = await fetch(listenEndpoint, { signal, headers: { 'ngrok-skip-browser-warning': '1' }, });
         if (!response.ok || !response.body) {
           console.warn(`[Audio Receiver] Stream response: ${response.status} ${response.statusText}`);
+          if (!signal.aborted) setTimeout(() => { if (!signal.aborted) pollOrStream(); }, 2000);
           return;
         }
-        console.log('[Audio Receiver] Stream connected');
+        console.log('[Audio Receiver] PCM stream connected');
 
-        // ---- pick the best codec the browser supports ----
-        const supportedType = typeof MediaSource !== 'undefined' && [
-          'audio/webm; codecs="opus"',
-          'audio/ogg; codecs="opus"',
-          'audio/webm',
-        ].find((type) => MediaSource.isTypeSupported(type));
-
-        if (!supportedType) {
-          console.error('[Audio Receiver] MediaSource not supported in this browser. Aborting.');
-          return;
-        }
-        console.log('[Audio Receiver] Using codec:', supportedType);
-
-        let useMediaSource = false;
-
-        const ms = new MediaSource();
-        const audio = new Audio();
-        audio.autoplay = true;
-        (audio as unknown as { playsInline: boolean }).playsInline = true;
-        audio.style.display = 'none';
-        document.body.appendChild(audio);
-        audio.src = URL.createObjectURL(ms);
-        audioElemRef.current = audio;
-        mediaSourceRef.current = ms;
-
-        ms.addEventListener('sourceopen', () => console.log('[MSE] sourceopen'));
-        ms.addEventListener('sourceclose', () => console.warn('[MSE] sourceclose'));
-        ms.addEventListener('sourceended', () => console.warn('[MSE] sourceended'));
-        audio.addEventListener('error', () => console.error('[audio] error', (audio as unknown as { error: unknown }).error));
-        audio.addEventListener('stalled', () => console.warn('[audio] stalled'));
-        audio.addEventListener('waiting', () => console.warn('[audio] waiting'));
-        audio.addEventListener('playing', () => console.log('[audio] playing'));
-        audio.addEventListener('timeupdate', () => {
-          const customAudio = audio as unknown as { _lastT?: number };
-          if (Math.floor(audio.currentTime) !== Math.floor(customAudio._lastT || -1)) {
-            customAudio._lastT = audio.currentTime;
-            console.log(
-              '[audio] t=',
-              audio.currentTime.toFixed(2),
-              'readyState=',
-              audio.readyState,
-              'buffered=',
-              audio.buffered.length,
-              'paused=',
-              audio.paused
-            );
+        // ---- raw PCM playback via WebAudio ----
+        // The backend streams s16le / mono / 24 kHz PCM (Gemini Live's native
+        // output format). Each chunk is scheduled back-to-back on the shared
+        // AudioContext so playback stays gapless with no decode step.
+        let ctx = audioContextRef.current;
+        if (!ctx || ctx.state === 'closed') {
+          const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+          if (!AudioCtx) {
+            console.error('[Audio Receiver] WebAudio not supported in this browser. Aborting.');
+            return;
           }
-        });
-
-        await new Promise<void>((resolve) => {
-          let settled = false;
-          const finish = () => {
-            if (settled) return;
-            settled = true;
-            resolve();
-          };
-
-          ms.addEventListener(
-            'sourceopen',
-            () => {
-              try {
-                const sb = ms.addSourceBuffer(supportedType);
-                sourceBufferRef.current = sb;
-
-                sb.addEventListener('error', (e) => {
-                  console.error('[MSE] SourceBuffer error', e);
-                });
-                sb.addEventListener('updateend', () => {
-                  if (chunkQueueRef.current.length > 0 && !sb.updating) {
-                    const next = chunkQueueRef.current.shift();
-                    if (next) {
-                      try {
-                        sb.appendBuffer(next);
-                      } catch (e) {
-                        console.error('[MSE] appendBuffer failed', e);
-                      }
-                    }
-                  }
-                  if (
-                    audioElemRef.current &&
-                    audioElemRef.current.paused &&
-                    audioElemRef.current.buffered.length > 0
-                  ) {
-                    audioElemRef.current.play().catch((e) =>
-                      console.warn('[audio] play() rejected:', e)
-                    );
-                  }
-                });
-
-                useMediaSource = true;
-                audio
-                  .play()
-                  .then(() => console.log('[audio] play() resolved'))
-                  .catch((e) => console.warn('[audio] play() rejected:', e));
-
-                console.log('[Audio Receiver] MediaSource ready, codec=', supportedType);
-              } catch (e) {
-                console.error('[Audio Receiver] addSourceBuffer failed', e);
-              }
-              finish();
-            },
-            { once: true }
-          );
-
-          setTimeout(() => {
-            if (!settled) {
-              console.error('[Audio Receiver] sourceopen timeout — MSE did not initialise');
-              finish();
-            }
-          }, 5000);
-        });
-
-        if (!useMediaSource) {
-          console.error('[Audio Receiver] MediaSource failed to initialise. Aborting receiver.');
-          return;
+          ctx = new AudioCtx();
+          audioContextRef.current = ctx;
         }
+        if (ctx.state === 'suspended') {
+          try { await ctx.resume(); } catch {}
+        }
+        console.log('[Audio Receiver] PCM ready — output', ctx.sampleRate, 'Hz, input 24000 Hz');
 
-        // ---- read the stream ----
+        // ---- read the raw PCM stream ----
+        const PCM_RATE = 24000;
         const reader = response.body.getReader();
+        let leftover = new Uint8Array(0); // carry an odd byte across chunks
         let totalBytes = 0;
         let totalChunks = 0;
+
         while (!signal.aborted) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -559,25 +422,41 @@ export default function App() {
 
           totalChunks += 1;
           totalBytes += value.byteLength;
-          if (totalChunks % 20 === 1) {
+          if (totalChunks % 50 === 1) {
             console.log(
               `[Audio Receiver] chunk ${totalChunks}, ${value.byteLength} B (total ${totalBytes} B)`
             );
           }
 
-          const sb = sourceBufferRef.current;
-          if (!sb) continue;
-
-          if (sb.updating || chunkQueueRef.current.length > 0) {
-            chunkQueueRef.current.push(value);
+          let bytes: Uint8Array;
+          if (leftover.length) {
+            bytes = new Uint8Array(leftover.length + value.byteLength);
+            bytes.set(leftover, 0);
+            bytes.set(value, leftover.length);
+            leftover = new Uint8Array(0);
           } else {
-            try {
-              sb.appendBuffer(value);
-            } catch (e) {
-              console.warn('[MSE] direct append failed, queued:', e);
-              chunkQueueRef.current.push(value);
-            }
+            bytes = value;
           }
+          const sampleBytes = bytes.byteLength - (bytes.byteLength % 2);
+          if (sampleBytes < bytes.byteLength) {
+            leftover = bytes.slice(sampleBytes);
+          }
+          if (sampleBytes === 0) continue;
+
+          const samples = sampleBytes >> 1;
+          const audioBuffer = ctx.createBuffer(1, samples, PCM_RATE);
+          const channel = audioBuffer.getChannelData(0);
+          const view = new DataView(bytes.buffer, bytes.byteOffset, sampleBytes);
+          for (let i = 0; i < samples; i++) {
+            channel[i] = view.getInt16(i * 2, true) / 32768;
+          }
+
+          const source = ctx.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(ctx.destination);
+          const startAt = Math.max(ctx.currentTime, nextPlayTimeRef.current);
+          source.start(startAt);
+          nextPlayTimeRef.current = startAt + audioBuffer.duration;
         }
 
         console.warn(
