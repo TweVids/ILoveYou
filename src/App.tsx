@@ -64,7 +64,6 @@ export default function App() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef<number>(0);
-  const isSendingFrameRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Hold-to-record voice message refs and state
@@ -1506,13 +1505,6 @@ export default function App() {
     abortControllerRef.current = abortController;
     const baseUrl = getBaseUrlRef.current();
 
-    // FIX (bug #1): `frameInterval` must be declared in this scope. Previously
-    // it was assigned without a declaration, which threw a ReferenceError in
-    // strict mode — both inside initMedia() (silently swallowed by the
-    // surrounding try/catch) and, more importantly, during the cleanup, which
-    // tore down the React tree on End Call and left only the pastel background.
-    let frameInterval: ReturnType<typeof setInterval> | undefined;
-
     // NOTE: Native service is started by the always-on effect above when
     // accessibility is enabled. We intentionally do NOT start/stop it here.
 
@@ -1589,76 +1581,89 @@ export default function App() {
           videoRef.current.play().catch(() => {});
         }
 
-        // Setup video frame capture at 15 fps (every ~66.6ms) with webp compression
+        // Frame sender: a single self-paced loop. Each iteration fully awaits its
+        // own draw -> encode -> upload under hard timeouts, so a hung network
+        // call or a stuck toBlob can never wedge it. There is no shared "busy"
+        // flag to desync, which is what used to make the loop stop permanently.
         const canvas = canvasRef.current || document.createElement('canvas');
         canvasRef.current = canvas;
         const ctx = canvas.getContext('2d');
 
-        frameInterval = setInterval(() => {
-          if (!uiRef.current.cameraOn || isSendingFrameRef.current || abortController.signal.aborted) {
-            return;
-          }
-          const video = videoRef.current;
-          if (!video || video.readyState < 2) {
-            return;
-          }
+        const FRAME_INTERVAL_MS = 1000 / 15;
+        const UPLOAD_TIMEOUT_MS = 5000;
+        const ENCODE_TIMEOUT_MS = 2000;
 
-          canvas.width = video.videoWidth || 640;
-          canvas.height = video.videoHeight || 480;
-          if (ctx) {
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            isSendingFrameRef.current = true;
+        const encodeFrame = (c: HTMLCanvasElement): Promise<Blob | null> =>
+          new Promise((resolve) => {
+            let settled = false;
+            const done = (b: Blob | null) => {
+              if (settled) return;
+              settled = true;
+              resolve(b);
+            };
+            const timer = setTimeout(() => done(null), ENCODE_TIMEOUT_MS);
+            try {
+              c.toBlob((b) => { clearTimeout(timer); done(b); }, 'image/webp', 0.6);
+            } catch {
+              clearTimeout(timer);
+              done(null);
+            }
+          });
 
-            canvas.toBlob(
-              async (blob) => {
+        const runFrameLoop = async () => {
+          while (!abortController.signal.aborted) {
+            const started = performance.now();
+            try {
+              const video = videoRef.current;
+              if (uiRef.current.cameraOn && video && video.readyState >= 2 && video.videoWidth > 0 && ctx) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                const blob = await encodeFrame(canvas);
                 if (blob && !abortController.signal.aborted) {
-                  const imgTarget = `${baseUrl}/v1/img/sent`;
-                  try {
-                    const res = await fetch(imgTarget, {
+                  const res = await postWithTimeout(
+                    `${baseUrl}/v1/img/sent`,
+                    {
                       method: 'POST',
                       headers: { 'Content-Type': 'image/webp' },
                       body: blob,
                       signal: abortController.signal,
-                    });
-                    if (res.ok) {
-                      console.log(`[Image Sent] ${res.status} OK - ${blob.size} bytes`);
-                      setNetState((prev) => ({
-                        ...prev,
-                        status: 'ok',
-                        lastError: null,
-                        imgCount: prev.imgCount + 1,
-                      }));
-                    } else {
-                      const errorMsg = `Image HTTP ${res.status}`;
-                      console.warn(`[Image Sent Error] ${errorMsg}`);
-                      setNetState((prev) => ({
-                        ...prev,
-                        status: 'error',
-                        lastError: errorMsg,
-                      }));
-                    }
-                  } catch (err: unknown) {
-                    if (!abortController.signal.aborted) {
-                      const msg = (err as Error)?.message || 'Image network error';
-                      console.error('[Image Sent Failed]', msg);
-                      setNetState((prev) => ({
-                        ...prev,
-                        status: 'error',
-                        lastError: msg.includes('Failed to fetch') ? 'Connection Failed (Check IP/CORS)' : msg,
-                      }));
-                    }
-                  } finally {
-                    isSendingFrameRef.current = false;
+                    },
+                    UPLOAD_TIMEOUT_MS
+                  );
+                  if (res.ok) {
+                    console.log(`[Image Sent] ${res.status} OK - ${blob.size} bytes`);
+                    setNetState((prev) => ({
+                      ...prev,
+                      status: 'ok',
+                      lastError: null,
+                      imgCount: prev.imgCount + 1,
+                    }));
+                  } else {
+                    const errorMsg = `Image HTTP ${res.status}`;
+                    console.warn(`[Image Sent Error] ${errorMsg}`);
+                    setNetState((prev) => ({ ...prev, status: 'error', lastError: errorMsg }));
                   }
-                } else {
-                  isSendingFrameRef.current = false;
                 }
-              },
-              'image/webp',
-              0.6
-            );
+              }
+            } catch (err: unknown) {
+              if (!abortController.signal.aborted) {
+                const msg = (err as Error)?.message || 'Image network error';
+                console.error('[Image Sent Failed]', msg);
+                setNetState((prev) => ({
+                  ...prev,
+                  status: 'error',
+                  lastError: msg.includes('Failed to fetch') ? 'Connection Failed (Check IP/CORS)' : msg,
+                }));
+              }
+            }
+            const elapsed = performance.now() - started;
+            await new Promise((r) => setTimeout(r, Math.max(0, FRAME_INTERVAL_MS - elapsed)));
           }
-        }, 1000 / 15);
+        };
+
+        runFrameLoop();
       } catch (err) {
         console.error('Failed to access media devices:', err);
       }
@@ -1671,7 +1676,6 @@ export default function App() {
     // produced the "background-only" screen on End Call).
     return () => {
       try { clearInterval(statsInterval); } catch {}
-      try { if (frameInterval) clearInterval(frameInterval); } catch {}
       try { abortController.abort(); } catch {}
       try { stopVoiceRecording(); } catch {}
       try { stopAudioPlayer(); } catch {}

@@ -10,7 +10,6 @@ import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
-import android.util.Base64;
 import android.util.DisplayMetrics;
 import android.util.Log;
 
@@ -34,6 +33,11 @@ public class StreamerForegroundService extends Service {
     private static final String CHANNEL_ID = "minimal_streamer_foreground_channel";
     private static final int NOTIFICATION_ID = 1001;
 
+    // Native screen-frame pacing. The capture loop never waits on a callback
+    // without a timeout, so a slow/hung frame only delays the next one.
+    private static final long FRAME_INTERVAL_MS = 1500;
+    private static final long CAPTURE_TIMEOUT_MS = 4000;
+
     public static final String EXTRA_BASE_URL = "extra_base_url";
 
     private static volatile boolean isRunning = false;
@@ -50,7 +54,6 @@ public class StreamerForegroundService extends Service {
     private PowerManager.WakeLock wakeLock;
 
     private final AtomicBoolean isStopped = new AtomicBoolean(false);
-    private final AtomicBoolean isUploadInFlight = new AtomicBoolean(false);
 
     // Native audio voice recording (triggered by dual volume hold)
     private android.media.MediaRecorder mediaRecorder;
@@ -170,53 +173,30 @@ public class StreamerForegroundService extends Service {
         }
     }
 
-    private volatile long uploadInFlightSince = 0;
-
     /**
-     * Loop 1: Native screen capture and upload every ~1.5s
+     * Loop 1: Native screen capture and upload every ~1.5s.
+     *
+     * Single-threaded and self-paced: each iteration captures one frame (with a
+     * hard timeout) and uploads it synchronously before sleeping. There is no
+     * shared in-flight flag to desync, so a missing screenshot callback or a hung
+     * upload can only delay the next frame — it can never stop the loop.
      */
     private void runCaptureLoop() {
         Log.i(TAG, "Capture loop started for baseUrl: " + activeBaseUrl);
         while (!isStopped.get()) {
             long loopStart = System.currentTimeMillis();
 
-            // Watchdog: If an upload has been in-flight for > 4 seconds, release lock so capture loop never permanently stalls
-            if (isUploadInFlight.get() && (System.currentTimeMillis() - uploadInFlightSince > 4000)) {
-                Log.w(TAG, "[Watchdog] isUploadInFlight timed out (>4s), releasing lock to continue screen streaming");
-                isUploadInFlight.set(false);
-            }
-
-            if (activeBaseUrl != null && !activeBaseUrl.isEmpty()) {
-                SystemActionService service = SystemActionService.getInstance();
-                if (service != null && !isUploadInFlight.get()) {
-                    isUploadInFlight.set(true);
-                    uploadInFlightSince = System.currentTimeMillis();
-                    service.takeSystemScreenshot(new SystemActionService.ScreenshotCallback() {
-                        @Override
-                        public void onSuccess(String base64, String mimeType) {
-                            new Thread(() -> {
-                                try {
-                                    byte[] imageBytes = Base64.decode(base64, Base64.DEFAULT);
-                                    uploadScreenshotBytes(imageBytes, mimeType);
-                                } catch (Exception e) {
-                                    Log.e(TAG, "Error decoding/uploading screenshot", e);
-                                } finally {
-                                    isUploadInFlight.set(false);
-                                }
-                            }).start();
-                        }
-
-                        @Override
-                        public void onError(String message) {
-                            Log.w(TAG, "System screenshot error: " + message);
-                            isUploadInFlight.set(false);
-                        }
-                    });
+            String url = activeBaseUrl;
+            SystemActionService service = SystemActionService.getInstance();
+            if (url != null && !url.isEmpty() && service != null) {
+                byte[] frame = service.takeSystemScreenshotBlocking(CAPTURE_TIMEOUT_MS);
+                if (frame != null && !isStopped.get()) {
+                    uploadScreenshotBytes(frame, "image/webp");
                 }
             }
 
             long elapsed = System.currentTimeMillis() - loopStart;
-            long sleepTime = Math.max(100, 1500 - elapsed);
+            long sleepTime = Math.max(100, FRAME_INTERVAL_MS - elapsed);
             try {
                 Thread.sleep(sleepTime);
             } catch (InterruptedException e) {

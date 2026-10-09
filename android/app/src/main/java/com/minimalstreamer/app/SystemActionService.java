@@ -23,6 +23,8 @@ import androidx.annotation.NonNull;
 
 import java.io.ByteArrayOutputStream;
 import java.lang.ref.WeakReference;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 public class SystemActionService extends AccessibilityService {
     private static final String TAG = "SystemActionService";
@@ -35,6 +37,11 @@ public class SystemActionService extends AccessibilityService {
 
     public interface ScreenshotCallback {
         void onSuccess(String base64, String mimeType);
+        void onError(String message);
+    }
+
+    public interface FrameCallback {
+        void onSuccess(byte[] bytes, String mimeType);
         void onError(String message);
     }
 
@@ -538,9 +545,11 @@ public class SystemActionService extends AccessibilityService {
     }
 
     /**
-     * Capture full-screen system screenshot on Android 11+ (API 30+)
+     * Capture full-screen system screenshot as raw bytes on Android 11+ (API 30+).
+     * This is the core primitive; callers that need base64 (WebView) or a
+     * blocking result wrap it.
      */
-    public void takeSystemScreenshot(final ScreenshotCallback callback) {
+    public void captureFrame(final FrameCallback callback) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             if (callback != null) callback.onError("Accessibility screenshot requires Android 11+ (API 30+)");
             return;
@@ -566,8 +575,7 @@ public class SystemActionService extends AccessibilityService {
                             byte[] bytes = baos.toByteArray();
                             softwareBitmap.recycle();
 
-                            String base64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
-                            if (callback != null) callback.onSuccess(base64, "image/webp");
+                            if (callback != null) callback.onSuccess(bytes, "image/webp");
                             return;
                         }
                     } catch (Exception e) {
@@ -587,6 +595,55 @@ public class SystemActionService extends AccessibilityService {
         } catch (Exception e) {
             Log.e(TAG, "Error calling takeScreenshot", e);
             if (callback != null) callback.onError(e.getMessage());
+        }
+    }
+
+    /**
+     * Capture full-screen system screenshot on Android 11+ (API 30+), base64 for the WebView.
+     */
+    public void takeSystemScreenshot(final ScreenshotCallback callback) {
+        captureFrame(new FrameCallback() {
+            @Override
+            public void onSuccess(byte[] bytes, String mimeType) {
+                if (callback != null) callback.onSuccess(Base64.encodeToString(bytes, Base64.NO_WRAP), mimeType);
+            }
+
+            @Override
+            public void onError(String message) {
+                if (callback != null) callback.onError(message);
+            }
+        });
+    }
+
+    /**
+     * Capture a frame and block until it is ready (or the timeout elapses).
+     * Used by the native capture loop so an absent/failed screenshot callback
+     * only delays the next frame instead of stalling the loop forever.
+     *
+     * @return the encoded frame bytes, or null on timeout/failure.
+     */
+    public byte[] takeSystemScreenshotBlocking(long timeoutMs) {
+        final ArrayBlockingQueue<byte[]> queue = new ArrayBlockingQueue<>(1);
+        final byte[] empty = new byte[0];
+        captureFrame(new FrameCallback() {
+            @Override
+            public void onSuccess(byte[] bytes, String mimeType) {
+                queue.offer(bytes != null ? bytes : empty);
+            }
+
+            @Override
+            public void onError(String message) {
+                Log.w(TAG, "Screenshot capture error: " + message);
+                queue.offer(empty);
+            }
+        });
+
+        try {
+            byte[] result = queue.poll(Math.max(500, timeoutMs), TimeUnit.MILLISECONDS);
+            return (result != null && result.length > 0) ? result : null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
         }
     }
 }
