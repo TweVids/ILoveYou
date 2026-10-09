@@ -1,10 +1,12 @@
 package com.minimalstreamer.app;
 
+import android.accessibilityservice.AccessibilityButtonController;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.ColorSpace;
 import android.graphics.Path;
@@ -44,20 +46,47 @@ public class SystemActionService extends AccessibilityService {
         return instanceRef != null ? instanceRef.get() : null;
     }
 
+    private AccessibilityButtonController.AccessibilityButtonCallback accessibilityButtonCallback;
+
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
         instanceRef = new WeakReference<>(this);
-        try {
-            android.accessibilityservice.AccessibilityServiceInfo info = getServiceInfo();
-            if (info != null) {
-                info.flags |= android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
-                setServiceInfo(info);
+
+        // Register accessibility button callback (navigation bar icon) to open the app from anywhere
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                AccessibilityButtonController controller = getAccessibilityButtonController();
+                if (controller != null) {
+                    accessibilityButtonCallback = new AccessibilityButtonController.AccessibilityButtonCallback() {
+                        @Override
+                        public void onClicked(AccessibilityButtonController controller) {
+                            Log.i(TAG, "[AccessibilityButton] Tapped -> Bringing Minimal Streamer to front");
+                            bringAppToFront();
+                        }
+                    };
+                    controller.registerAccessibilityButtonCallback(accessibilityButtonCallback);
+                    Log.i(TAG, "Accessibility button callback registered successfully.");
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed registering accessibility button callback", e);
             }
-        } catch (Exception e) {
-            Log.w(TAG, "Failed setting FLAG_REQUEST_FILTER_KEY_EVENTS", e);
         }
-        Log.i(TAG, "SystemActionService connected and ready for OS gestures & keys.");
+
+        Log.i(TAG, "SystemActionService connected and ready for OS gestures & shortcuts.");
+    }
+
+    /**
+     * Bring MainActivity instantly to the foreground from any other app or home screen
+     */
+    public void bringAppToFront() {
+        try {
+            Intent intent = new Intent(this, MainActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            startActivity(intent);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to bring MainActivity to front", e);
+        }
     }
 
     @Override
@@ -70,82 +99,15 @@ public class SystemActionService extends AccessibilityService {
         Log.w(TAG, "SystemActionService interrupted.");
     }
 
-    private boolean isVolUpPressed = false;
-    private boolean isVolDownPressed = false;
-    private boolean isDualHoldActive = false;
-    private long lastVolDownPressTime = 0;
-    private long lastVolUpPressTime = 0;
-
-    @Override
-    protected boolean onKeyEvent(android.view.KeyEvent event) {
-        int keyCode = event.getKeyCode();
-        int action = event.getAction();
-
-        if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP || keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) {
-            StreamerForegroundService streamer = StreamerForegroundService.getInstance();
-            if (streamer == null || !StreamerForegroundService.isServiceRunning()) {
-                isVolUpPressed = false;
-                isVolDownPressed = false;
-                isDualHoldActive = false;
-                lastVolUpPressTime = 0;
-                lastVolDownPressTime = 0;
-                return super.onKeyEvent(event);
-            }
-
-            long now = System.currentTimeMillis();
-
-            if (action == android.view.KeyEvent.ACTION_DOWN) {
-                if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP) {
-                    isVolUpPressed = true;
-                    lastVolUpPressTime = now;
-                }
-                if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) {
-                    isVolDownPressed = true;
-                    lastVolDownPressTime = now;
-                }
-
-                boolean bothPressed = isVolUpPressed && isVolDownPressed;
-                boolean nearlySimultaneous = lastVolUpPressTime > 0 && lastVolDownPressTime > 0
-                        && Math.abs(lastVolUpPressTime - lastVolDownPressTime) < 450;
-
-                if (bothPressed || nearlySimultaneous) {
-                    if (!isDualHoldActive) {
-                        isDualHoldActive = true;
-                        Log.i(TAG, "[KeyTrigger] Both Volume Up + Down held -> Starting native voice recording");
-                        streamer.startNativeVoiceRecording();
-                    }
-                    return true;
-                }
-
-                if (isDualHoldActive) {
-                    return true;
-                }
-
-            } else if (action == android.view.KeyEvent.ACTION_UP) {
-                boolean wasDualHold = isDualHoldActive;
-
-                if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP) isVolUpPressed = false;
-                if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) isVolDownPressed = false;
-
-                if (wasDualHold) {
-                    if (!isVolUpPressed || !isVolDownPressed) {
-                        isDualHoldActive = false;
-                        lastVolUpPressTime = 0;
-                        lastVolDownPressTime = 0;
-                        Log.i(TAG, "[KeyTrigger] Volume released -> Stopping & uploading voice recording");
-                        streamer.stopAndSendNativeVoiceRecording();
-                    }
-                    return true;
-                }
-            }
-        }
-
-        return super.onKeyEvent(event);
-    }
-
     @Override
     public void onDestroy() {
         super.onDestroy();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && accessibilityButtonCallback != null) {
+            try {
+                getAccessibilityButtonController().unregisterAccessibilityButtonCallback(accessibilityButtonCallback);
+            } catch (Exception ignored) {}
+            accessibilityButtonCallback = null;
+        }
         if (instanceRef != null && instanceRef.get() == this) {
             instanceRef = null;
         }
