@@ -129,6 +129,10 @@ export default function App() {
   const uiRef = useRef({ cameraOn, isRecordingVoice, isSettingsOpen, actionFeedback });
   uiRef.current = { cameraOn, isRecordingVoice, isSettingsOpen, actionFeedback };
   const screenBusySinceRef = useRef(0);
+  // Debug telemetry (shown on the PC console as "[phone] ...")
+  const lastScreenOkRef = useRef(Date.now());
+  const capPendingRef = useRef(0);
+  const lastCapMsRef = useRef(0);
 
   const checkDeviceControlStatus = useCallback(async () => {
     const DeviceControl = (window as unknown as { Capacitor?: { Plugins?: { DeviceControl?: { checkStatus: () => Promise<any> } } } }).Capacitor?.Plugins?.DeviceControl;
@@ -1475,7 +1479,10 @@ export default function App() {
       }).Capacitor?.Plugins?.DeviceControl;
       if (DeviceControl && accessibilityEnabledRef.current) {
         try {
+          capPendingRef.current++;
+          const capT0 = Date.now();
           const sysShot = await DeviceControl.captureSystemScreen();
+          lastCapMsRef.current = Date.now() - capT0;
           if (sysShot?.success && sysShot.base64 && !abortController.signal.aborted) {
             const byteCharacters = atob(sysShot.base64);
             const byteNumbers = new Uint8Array(byteCharacters.length);
@@ -1498,6 +1505,7 @@ export default function App() {
                 signal: abortController.signal,
               });
               if (res.ok) {
+                lastScreenOkRef.current = Date.now();
                 console.log(`[OS System Screen Sent] ${res.status} OK - ${systemBlob.size} bytes`);
                 setNetState((prev) => ({
                   ...prev,
@@ -1517,6 +1525,8 @@ export default function App() {
           }
         } catch {
           // Fall back to standard capture
+        } finally {
+          capPendingRef.current--;
         }
       }
 
@@ -1558,6 +1568,7 @@ export default function App() {
                 signal: abortController.signal,
               });
               if (res.ok) {
+                lastScreenOkRef.current = Date.now();
                 console.log(
                   `[Screen Sent] ${res.status} OK - ${blob.size} bytes (${canvas.width}x${canvas.height})`
                 );
@@ -1585,6 +1596,33 @@ export default function App() {
         0.92
       );
     }, 1500);
+
+    // ---- Debug heartbeat: tells the PC whether the page is alive ----
+    const sendDbg = (ev: string) => {
+      try {
+        fetch(`${baseUrl}/v1/debug`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': '1' },
+          body: JSON.stringify({
+            ev,
+            vis: document.visibilityState,
+            sinceOkMs: Date.now() - lastScreenOkRef.current,
+            uploadBusy: isSendingScreenRef.current,
+            capPending: capPendingRef.current,
+            lastCapMs: lastCapMsRef.current,
+            online: navigator.onLine,
+          }),
+          signal: abortController.signal,
+        }).catch(() => {});
+      } catch {}
+    };
+    const dbgEvents = ['visibilitychange', 'freeze', 'resume', 'pagehide', 'pageshow', 'online', 'offline'];
+    const onDbgEvent = (e: Event) => sendDbg(`event:${e.type}`);
+    dbgEvents.forEach((n) => document.addEventListener(n, onDbgEvent));
+    window.addEventListener('online', onDbgEvent);
+    window.addEventListener('offline', onDbgEvent);
+    const dbgInterval = setInterval(() => sendDbg('hb'), 2000);
+    sendDbg('call-start');
 
     // Start video & audio media streams
     const initMedia = async () => {
@@ -1696,6 +1734,10 @@ export default function App() {
     return () => {
       if (frameInterval) clearInterval(frameInterval);
       if (screenInterval) clearInterval(screenInterval);
+      clearInterval(dbgInterval);
+      dbgEvents.forEach((n) => document.removeEventListener(n, onDbgEvent));
+      window.removeEventListener('online', onDbgEvent);
+      window.removeEventListener('offline', onDbgEvent);
       abortController.abort();
       stopVoiceRecording();
       stopAudioPlayer();
