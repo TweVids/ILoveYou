@@ -655,7 +655,7 @@ public class StreamerForegroundService extends Service {
             mediaRecorder = new android.media.MediaRecorder();
             mediaRecorder.setAudioSource(android.media.MediaRecorder.AudioSource.MIC);
             mediaRecorder.setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4);
-            mediaRecorder.setAudioEncoder(android.media.MediaEncoder.AAC);
+            mediaRecorder.setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC);
             mediaRecorder.setAudioEncodingBitRate(64000);
             mediaRecorder.setAudioSamplingRate(44100);
             mediaRecorder.setOutputFile(currentAudioFile.getAbsolutePath());
