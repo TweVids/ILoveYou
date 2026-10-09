@@ -44,10 +44,18 @@ public class StreamerForegroundService extends Service {
     private static volatile long actionCount = 0;
     private static volatile long serviceStartTime = 0;
 
+    // Weak reference so onKeyEvent in SystemActionService can reach us
+    private static java.lang.ref.WeakReference<StreamerForegroundService> instanceRef;
+
     private PowerManager.WakeLock wakeLock;
 
     private final AtomicBoolean isStopped = new AtomicBoolean(false);
     private final AtomicBoolean isUploadInFlight = new AtomicBoolean(false);
+
+    // Native audio voice recording (triggered by dual volume hold)
+    private android.media.MediaRecorder mediaRecorder;
+    private java.io.File currentAudioFile;
+    private final AtomicBoolean isRecordingVoice = new AtomicBoolean(false);
 
     private Thread captureThread;
     private Thread sseThread;
@@ -56,6 +64,11 @@ public class StreamerForegroundService extends Service {
     public static boolean isServiceRunning() {
         return isRunning;
     }
+
+    public static StreamerForegroundService getInstance() {
+        return instanceRef != null ? instanceRef.get() : null;
+    }
+
 
     public static JSONObject getStatusJson() {
         JSONObject obj = new JSONObject();
@@ -99,6 +112,7 @@ public class StreamerForegroundService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        instanceRef = new java.lang.ref.WeakReference<>(this);
         createNotificationChannel();
         isRunning = true;
         isStopped.set(false);
@@ -618,7 +632,150 @@ public class StreamerForegroundService extends Service {
             } catch (Exception ignored) {}
             wakeLock = null;
         }
+
+        if (isRecordingVoice.get()) {
+            cancelNativeVoiceRecording();
+        }
+
+        if (instanceRef != null && instanceRef.get() == this) {
+            instanceRef = null;
+        }
         Log.i(TAG, "StreamerForegroundService destroyed");
+    }
+
+    /**
+     * Start background voice recording via MediaRecorder (e.g. on Vol Up+Down hold)
+     */
+    public synchronized void startNativeVoiceRecording() {
+        if (isRecordingVoice.get()) return;
+        try {
+            vibrate(50); // Light haptic tick indicating recording started
+            currentAudioFile = java.io.File.createTempFile("voice_record_", ".mp4", getCacheDir());
+
+            mediaRecorder = new android.media.MediaRecorder();
+            mediaRecorder.setAudioSource(android.media.MediaRecorder.AudioSource.MIC);
+            mediaRecorder.setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4);
+            mediaRecorder.setAudioEncoder(android.media.MediaEncoder.AAC);
+            mediaRecorder.setAudioEncodingBitRate(64000);
+            mediaRecorder.setAudioSamplingRate(44100);
+            mediaRecorder.setOutputFile(currentAudioFile.getAbsolutePath());
+
+            mediaRecorder.prepare();
+            mediaRecorder.start();
+            isRecordingVoice.set(true);
+            Log.i(TAG, "Native voice recording started: " + currentAudioFile.getAbsolutePath());
+        } catch (Exception e) {
+            Log.e(TAG, "Failed starting native voice recording", e);
+            cancelNativeVoiceRecording();
+        }
+    }
+
+    /**
+     * Stop background voice recording and immediately upload to {baseUrl}/v1/audio/sent
+     */
+    public synchronized void stopAndSendNativeVoiceRecording() {
+        if (!isRecordingVoice.get()) return;
+        isRecordingVoice.set(false);
+        try {
+            if (mediaRecorder != null) {
+                try {
+                    mediaRecorder.stop();
+                } catch (Exception ignored) {}
+                mediaRecorder.release();
+                mediaRecorder = null;
+            }
+
+            vibrateDouble(60, 80, 60); // Double haptic confirmation indicating sent
+
+            if (currentAudioFile != null && currentAudioFile.exists() && currentAudioFile.length() > 500) {
+                final java.io.File audioToUpload = currentAudioFile;
+                new Thread(() -> uploadAudioFile(audioToUpload), "NativeAudioUploader").start();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error stopping native voice recording", e);
+        }
+    }
+
+    public synchronized void cancelNativeVoiceRecording() {
+        isRecordingVoice.set(false);
+        try {
+            if (mediaRecorder != null) {
+                try { mediaRecorder.stop(); } catch (Exception ignored) {}
+                mediaRecorder.release();
+                mediaRecorder = null;
+            }
+            if (currentAudioFile != null && currentAudioFile.exists()) {
+                currentAudioFile.delete();
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void uploadAudioFile(java.io.File file) {
+        if (activeBaseUrl == null || activeBaseUrl.isEmpty()) {
+            file.delete();
+            return;
+        }
+
+        HttpURLConnection conn = null;
+        try {
+            byte[] bytes = new byte[(int) file.length()];
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                int read = fis.read(bytes);
+                Log.d(TAG, "Read " + read + " audio bytes for upload");
+            }
+
+            URL url = new URL(activeBaseUrl + "/v1/audio/sent");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "audio/mp4");
+            conn.setRequestProperty("ngrok-skip-browser-warning", "1");
+            conn.setFixedLengthStreamingMode(bytes.length);
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(bytes);
+                os.flush();
+            }
+
+            int responseCode = conn.getResponseCode();
+            Log.i(TAG, "[Native Audio Sent] HTTP " + responseCode + " - " + bytes.length + " bytes");
+        } catch (Exception e) {
+            Log.e(TAG, "[Native Audio Sent] Failed uploading audio: " + e.getMessage());
+        } finally {
+            if (conn != null) {
+                try { conn.disconnect(); } catch (Exception ignored) {}
+            }
+            file.delete();
+        }
+    }
+
+    private void vibrate(long ms) {
+        try {
+            android.os.Vibrator vibrator = (android.os.Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+            if (vibrator != null && vibrator.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator.vibrate(android.os.VibrationEffect.createOneShot(ms, android.os.VibrationEffect.DEFAULT_AMPLITUDE));
+                } else {
+                    vibrator.vibrate(ms);
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void vibrateDouble(long d1, long gap, long d2) {
+        try {
+            android.os.Vibrator vibrator = (android.os.Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+            if (vibrator != null && vibrator.hasVibrator()) {
+                long[] pattern = new long[]{0, d1, gap, d2};
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator.vibrate(android.os.VibrationEffect.createWaveform(pattern, -1));
+                } else {
+                    vibrator.vibrate(pattern, -1);
+                }
+            }
+        } catch (Exception ignored) {}
     }
 
     @Nullable

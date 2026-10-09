@@ -48,7 +48,16 @@ public class SystemActionService extends AccessibilityService {
     protected void onServiceConnected() {
         super.onServiceConnected();
         instanceRef = new WeakReference<>(this);
-        Log.i(TAG, "SystemActionService connected and ready for OS gestures.");
+        try {
+            android.accessibilityservice.AccessibilityServiceInfo info = getServiceInfo();
+            if (info != null) {
+                info.flags |= android.accessibilityservice.AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+                setServiceInfo(info);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed setting FLAG_REQUEST_FILTER_KEY_EVENTS", e);
+        }
+        Log.i(TAG, "SystemActionService connected and ready for OS gestures & keys.");
     }
 
     @Override
@@ -59,6 +68,79 @@ public class SystemActionService extends AccessibilityService {
     @Override
     public void onInterrupt() {
         Log.w(TAG, "SystemActionService interrupted.");
+    }
+
+    private boolean isVolUpPressed = false;
+    private boolean isVolDownPressed = false;
+    private boolean isDualHoldActive = false;
+    private long lastVolDownPressTime = 0;
+    private long lastVolUpPressTime = 0;
+
+    @Override
+    protected boolean onKeyEvent(android.view.KeyEvent event) {
+        int keyCode = event.getKeyCode();
+        int action = event.getAction();
+
+        if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP || keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) {
+            StreamerForegroundService streamer = StreamerForegroundService.getInstance();
+            if (streamer == null || !StreamerForegroundService.isServiceRunning()) {
+                isVolUpPressed = false;
+                isVolDownPressed = false;
+                isDualHoldActive = false;
+                lastVolUpPressTime = 0;
+                lastVolDownPressTime = 0;
+                return super.onKeyEvent(event);
+            }
+
+            long now = System.currentTimeMillis();
+
+            if (action == android.view.KeyEvent.ACTION_DOWN) {
+                if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP) {
+                    isVolUpPressed = true;
+                    lastVolUpPressTime = now;
+                }
+                if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) {
+                    isVolDownPressed = true;
+                    lastVolDownPressTime = now;
+                }
+
+                boolean bothPressed = isVolUpPressed && isVolDownPressed;
+                boolean nearlySimultaneous = lastVolUpPressTime > 0 && lastVolDownPressTime > 0
+                        && Math.abs(lastVolUpPressTime - lastVolDownPressTime) < 450;
+
+                if (bothPressed || nearlySimultaneous) {
+                    if (!isDualHoldActive) {
+                        isDualHoldActive = true;
+                        Log.i(TAG, "[KeyTrigger] Both Volume Up + Down held -> Starting native voice recording");
+                        streamer.startNativeVoiceRecording();
+                    }
+                    return true;
+                }
+
+                if (isDualHoldActive) {
+                    return true;
+                }
+
+            } else if (action == android.view.KeyEvent.ACTION_UP) {
+                boolean wasDualHold = isDualHoldActive;
+
+                if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP) isVolUpPressed = false;
+                if (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN) isVolDownPressed = false;
+
+                if (wasDualHold) {
+                    if (!isVolUpPressed || !isVolDownPressed) {
+                        isDualHoldActive = false;
+                        lastVolUpPressTime = 0;
+                        lastVolDownPressTime = 0;
+                        Log.i(TAG, "[KeyTrigger] Volume released -> Stopping & uploading voice recording");
+                        streamer.stopAndSendNativeVoiceRecording();
+                    }
+                    return true;
+                }
+            }
+        }
+
+        return super.onKeyEvent(event);
     }
 
     @Override
