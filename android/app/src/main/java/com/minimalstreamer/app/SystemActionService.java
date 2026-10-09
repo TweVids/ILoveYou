@@ -66,7 +66,12 @@ public class SystemActionService extends AccessibilityService {
                         }
                     };
                     controller.registerAccessibilityButtonCallback(accessibilityButtonCallback);
-                    Log.i(TAG, "Accessibility button callback registered successfully.");
+                    if (controller.isAccessibilityButtonAvailable()) {
+                        Log.i(TAG, "Accessibility button callback registered and button is available.");
+                    } else {
+                        Log.w(TAG, "Accessibility button callback registered, but the accessibility button is NOT available. " +
+                                "Enable it in Settings > Accessibility > accessibility button/shortcut.");
+                    }
                 }
             } catch (Exception e) {
                 Log.w(TAG, "Failed registering accessibility button callback", e);
@@ -82,7 +87,7 @@ public class SystemActionService extends AccessibilityService {
     public void bringAppToFront() {
         try {
             Intent intent = new Intent(this, MainActivity.class);
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             startActivity(intent);
         } catch (Exception e) {
             Log.e(TAG, "Failed to bring MainActivity to front", e);
