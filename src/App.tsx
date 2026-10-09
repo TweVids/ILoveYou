@@ -5,6 +5,18 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 
+// Upload with a hard timeout so one hung POST can never block later frames.
+const postWithTimeout = (url: string, init: RequestInit, ms = 6000) => {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), ms);
+  const outer = init.signal as AbortSignal | undefined;
+  if (outer) {
+    if (outer.aborted) c.abort();
+    else outer.addEventListener('abort', () => c.abort(), { once: true });
+  }
+  return fetch(url, { ...init, signal: c.signal }).finally(() => clearTimeout(t));
+};
+
 export default function App() {
   const [inCall, setInCall] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -112,6 +124,12 @@ export default function App() {
   });
   const accessibilityEnabledRef = useRef(false);
 
+  // Latest UI state, read through a ref so the stream effect does NOT restart
+  // every time an action flashes feedback / settings open / mic toggles.
+  const uiRef = useRef({ cameraOn, isRecordingVoice, isSettingsOpen, actionFeedback });
+  uiRef.current = { cameraOn, isRecordingVoice, isSettingsOpen, actionFeedback };
+  const screenBusySinceRef = useRef(0);
+
   const checkDeviceControlStatus = useCallback(async () => {
     const DeviceControl = (window as unknown as { Capacitor?: { Plugins?: { DeviceControl?: { checkStatus: () => Promise<any> } } } }).Capacitor?.Plugins?.DeviceControl;
     if (DeviceControl && typeof DeviceControl.checkStatus === 'function') {
@@ -158,6 +176,8 @@ export default function App() {
     }
     return base.replace(/\/+$/, '');
   }, [provider, hostInput, endpointInput]);
+  const getBaseUrlRef = useRef(getBaseUrl);
+  getBaseUrlRef.current = getBaseUrl;
 
   // Save settings and test connection
   const handleSaveAndCheckConnection = useCallback(async () => {
@@ -602,7 +622,8 @@ export default function App() {
     const DeviceControl = (window as unknown as {
       Capacitor?: { Plugins?: { DeviceControl?: { performAction: (args: any) => Promise<any> } } };
     }).Capacitor?.Plugins?.DeviceControl;
-    if (DeviceControl && accessibilityEnabledRef.current) {
+    const nativeActive = Boolean(DeviceControl && accessibilityEnabledRef.current);
+    if (DeviceControl && nativeActive) {
       DeviceControl.performAction({
         action: params.action,
         x1: params.x1,
@@ -620,7 +641,10 @@ export default function App() {
 
     const normalizedAction = (params.action || '').toLowerCase().replace(/^scroll_/, 'stroll_');
 
-    if (normalizedAction === 'click') {
+    if (nativeActive) {
+      // The native accessibility service already performed the gesture on the
+      // real screen. Do NOT also poke this app's own (hidden) DOM.
+    } else if (normalizedAction === 'click') {
       const target = document.elementFromPoint(realX1, realY1);
       if (target) {
         const clickable =
@@ -742,6 +766,7 @@ export default function App() {
 
     // Drag / gesture movement if x2 and y2 provided
     if (
+      !nativeActive &&
       params.x2 !== undefined &&
       params.y2 !== undefined &&
       (params.x2 !== params.x1 || params.y2 !== params.y1)
@@ -793,7 +818,8 @@ export default function App() {
       Capacitor?: { Plugins?: { DeviceControl?: { performSystemAction: (args: any) => Promise<any> } } };
     }).Capacitor?.Plugins?.DeviceControl;
 
-    if (DeviceControl && accessibilityEnabledRef.current) {
+    const nativeActive = Boolean(DeviceControl && accessibilityEnabledRef.current);
+    if (DeviceControl && nativeActive) {
       DeviceControl.performSystemAction({ action: rawAction }).catch((e: unknown) => {
         console.warn('[DeviceControl] System navigation error:', e);
       });
@@ -802,9 +828,9 @@ export default function App() {
     // Web fallback behavior
     if (rawAction === 'previous' || rawAction === 'back') {
       try {
-        if (isSettingsOpen) {
+        if (uiRef.current.isSettingsOpen) {
           setIsSettingsOpen(false);
-        } else {
+        } else if (!nativeActive) {
           window.history.back();
         }
       } catch {}
@@ -818,7 +844,7 @@ export default function App() {
       ...prev,
       uiActionCount: prev.uiActionCount + 1,
     }));
-  }, [isSettingsOpen]);
+  }, []);
 
   // Execute direct intent action (YouTube, Zalo, Phone Call, Web Search, App)
   const executeIntentAction = useCallback((params: {
@@ -852,14 +878,17 @@ export default function App() {
       Capacitor?: { Plugins?: { DeviceControl?: { launchIntent: (args: any) => Promise<any> } } };
     }).Capacitor?.Plugins?.DeviceControl;
 
-    if (DeviceControl && accessibilityEnabledRef.current) {
+    const nativeActive = Boolean(DeviceControl && accessibilityEnabledRef.current);
+    if (DeviceControl && nativeActive) {
       DeviceControl.launchIntent(params).catch((e: unknown) => {
         console.warn('[DeviceControl] Launch intent error:', e);
       });
     }
 
-    // Web fallback
-    if (rawTarget === 'web_search' && params.query) {
+    // Web fallback (only when the native service is not handling it)
+    if (nativeActive) {
+      // native already launched it
+    } else if (rawTarget === 'web_search' && params.query) {
       window.open(`https://www.google.com/search?q=${encodeURIComponent(params.query)}`, '_blank');
     } else if (rawTarget === 'youtube' && params.query) {
       window.open(`https://www.youtube.com/results?search_query=${encodeURIComponent(params.query)}`, '_blank');
@@ -906,7 +935,8 @@ export default function App() {
       Capacitor?: { Plugins?: { DeviceControl?: { performElementAction: (args: any) => Promise<any> } } };
     }).Capacitor?.Plugins?.DeviceControl;
 
-    if (DeviceControl && accessibilityEnabledRef.current) {
+    const nativeActive = Boolean(DeviceControl && accessibilityEnabledRef.current);
+    if (DeviceControl && nativeActive) {
       DeviceControl.performElementAction(params).then((res: any) => {
         console.log('[DeviceControl] Element action result:', res);
       }).catch((e: unknown) => {
@@ -915,7 +945,7 @@ export default function App() {
     }
 
     // Web fallback for clicking elements by text
-    if (act === 'click' && params.target_text) {
+    if (!nativeActive && act === 'click' && params.target_text) {
       const q = params.target_text.toLowerCase();
       const allElements = Array.from(document.querySelectorAll('button, a, [role="button"], span, p, label'));
       const match = allElements.find((el) => el.textContent?.toLowerCase().includes(q)) as HTMLElement | undefined;
@@ -1150,6 +1180,7 @@ export default function App() {
   // Render high-fidelity full-resolution viewport canvas snapshot
   const renderAppViewportToCanvas = useCallback(
     (canvas: HTMLCanvasElement): boolean => {
+      const { cameraOn, isRecordingVoice, isSettingsOpen, actionFeedback } = uiRef.current;
       const ctx = canvas.getContext('2d');
       if (!ctx) return false;
 
@@ -1301,7 +1332,7 @@ export default function App() {
 
       return true;
     },
-    [cameraOn, isRecordingVoice, isSettingsOpen, actionFeedback]
+    []
   );
 
   // Toggle optional OS-level screen share via getDisplayMedia
@@ -1388,7 +1419,7 @@ export default function App() {
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
-    const baseUrl = getBaseUrl();
+    const baseUrl = getBaseUrlRef.current();
 
     // Start native Android foreground service to keep network & streaming active in background
     const DeviceControl = (window as unknown as {
@@ -1430,8 +1461,12 @@ export default function App() {
 
     // Setup phone screenshot capture every 1.5s (1500 ms delay) to /v1/screen/sent
     screenInterval = setInterval(async () => {
-      if (isSendingScreenRef.current || abortController.signal.aborted) {
-        return;
+      if (abortController.signal.aborted) return;
+      if (isSendingScreenRef.current) {
+        // Watchdog: never let a stuck upload block frames forever.
+        if (Date.now() - screenBusySinceRef.current < 8000) return;
+        console.warn('[Screen] upload stuck >8s, resetting busy flag');
+        isSendingScreenRef.current = false;
       }
 
       // If native Android Accessibility service is enabled, capture the full OS system screen across any app
@@ -1450,9 +1485,10 @@ export default function App() {
             const systemBlob = new Blob([byteNumbers], { type: sysShot.mimeType || 'image/webp' });
 
             isSendingScreenRef.current = true;
+            screenBusySinceRef.current = Date.now();
             const screenTarget = `${baseUrl}/v1/screen/sent`;
             try {
-              const res = await fetch(screenTarget, {
+              const res = await postWithTimeout(screenTarget, {
                 method: 'POST',
                 headers: {
                   'Content-Type': systemBlob.type,
@@ -1506,12 +1542,13 @@ export default function App() {
       if (!captured) return;
 
       isSendingScreenRef.current = true;
+      screenBusySinceRef.current = Date.now();
       canvas.toBlob(
         async (blob) => {
           if (blob && !abortController.signal.aborted) {
             const screenTarget = `${baseUrl}/v1/screen/sent`;
             try {
-              const res = await fetch(screenTarget, {
+              const res = await postWithTimeout(screenTarget, {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'image/webp',
@@ -1585,7 +1622,7 @@ export default function App() {
         const ctx = canvas.getContext('2d');
 
         frameInterval = setInterval(() => {
-          if (!cameraOn || isSendingFrameRef.current || abortController.signal.aborted) {
+          if (!uiRef.current.cameraOn || isSendingFrameRef.current || abortController.signal.aborted) {
             return;
           }
           const video = videoRef.current;
@@ -1681,9 +1718,6 @@ export default function App() {
     };
   }, [
     inCall,
-    getBaseUrl,
-    cameraOn,
-    recorderOn,
     startAudioReceiver,
     startScreenReceiver,
     renderAppViewportToCanvas,
