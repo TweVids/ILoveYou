@@ -1410,12 +1410,12 @@ export default function App() {
       setIsSharingDeviceScreen(false);
       stopAudioPlayer();
 
-      // Stop native Android foreground service
+      // Stop native Android streaming foreground service
       const DeviceControl = (window as unknown as {
-        Capacitor?: { Plugins?: { DeviceControl?: { stopForegroundService?: () => Promise<any> } } };
+        Capacitor?: { Plugins?: { DeviceControl?: { stopService?: () => Promise<any> } } };
       }).Capacitor?.Plugins?.DeviceControl;
-      if (DeviceControl && typeof DeviceControl.stopForegroundService === 'function') {
-        DeviceControl.stopForegroundService().catch(() => {});
+      if (DeviceControl && typeof DeviceControl.stopService === 'function') {
+        DeviceControl.stopService().catch(() => {});
       }
 
       return;
@@ -1425,13 +1425,13 @@ export default function App() {
     abortControllerRef.current = abortController;
     const baseUrl = getBaseUrlRef.current();
 
-    // Start native Android foreground service to keep network & streaming active in background
+    // Start native Android foreground service (handles screen capture, uploads, SSE action stream, and dispatching natively)
     const DeviceControl = (window as unknown as {
-      Capacitor?: { Plugins?: { DeviceControl?: { startForegroundService?: () => Promise<any> } } };
+      Capacitor?: { Plugins?: { DeviceControl?: { startService?: (args: { baseUrl: string }) => Promise<any> } } };
     }).Capacitor?.Plugins?.DeviceControl;
-    if (DeviceControl && typeof DeviceControl.startForegroundService === 'function') {
-      DeviceControl.startForegroundService().catch((e: unknown) => {
-        console.warn('[ForegroundService] Start failed:', e);
+    if (DeviceControl && typeof DeviceControl.startService === 'function') {
+      DeviceControl.startService({ baseUrl }).catch((e: unknown) => {
+        console.warn('[NativeService] Start failed:', e);
       });
     }
 
@@ -1443,7 +1443,7 @@ export default function App() {
       screenCount: 0,
       uiActionCount: 0,
     });
-    console.log(`[Stream Started] Target server base URL: ${baseUrl}`);
+    console.log(`[Stream Started] Target server base URL: ${baseUrl} (Native foreground service running)`);
 
     // Initialize AudioContext on user call gesture
     const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -1457,172 +1457,26 @@ export default function App() {
     // Start receiver for audio output
     startAudioReceiver(baseUrl, abortController.signal);
 
-    // Start receiver for screen UI tool actions
-    startScreenReceiver(baseUrl, abortController.signal);
-
-    let frameInterval: NodeJS.Timeout | null = null;
-    let screenInterval: NodeJS.Timeout | null = null;
-
-    // Setup phone screenshot capture every 1.5s (1500 ms delay) to /v1/screen/sent
-    screenInterval = setInterval(async () => {
+    // Periodically poll native service telemetry to keep in-app stats updated
+    const statsInterval = setInterval(async () => {
       if (abortController.signal.aborted) return;
-      if (isSendingScreenRef.current) {
-        // Watchdog: never let a stuck upload block frames forever.
-        if (Date.now() - screenBusySinceRef.current < 8000) return;
-        console.warn('[Screen] upload stuck >8s, resetting busy flag');
-        isSendingScreenRef.current = false;
-      }
-
-      // If native Android Accessibility service is enabled, capture the full OS system screen across any app
-      const DeviceControl = (window as unknown as {
-        Capacitor?: { Plugins?: { DeviceControl?: { captureSystemScreen: () => Promise<any> } } };
+      const DC = (window as unknown as {
+        Capacitor?: { Plugins?: { DeviceControl?: { getServiceStatus?: () => Promise<any> } } };
       }).Capacitor?.Plugins?.DeviceControl;
-      if (DeviceControl && accessibilityEnabledRef.current) {
+      if (DC && typeof DC.getServiceStatus === 'function') {
         try {
-          capPendingRef.current++;
-          const capT0 = Date.now();
-          const sysShot = await DeviceControl.captureSystemScreen();
-          lastCapMsRef.current = Date.now() - capT0;
-          if (sysShot?.success && sysShot.base64 && !abortController.signal.aborted) {
-            const byteCharacters = atob(sysShot.base64);
-            const byteNumbers = new Uint8Array(byteCharacters.length);
-            for (let i = 0; i < byteCharacters.length; i++) {
-              byteNumbers[i] = byteCharacters.charCodeAt(i);
-            }
-            const systemBlob = new Blob([byteNumbers], { type: sysShot.mimeType || 'image/webp' });
-
-            isSendingScreenRef.current = true;
-            screenBusySinceRef.current = Date.now();
-            const screenTarget = `${baseUrl}/v1/screen/sent`;
-            try {
-              const res = await postWithTimeout(screenTarget, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': systemBlob.type,
-                  'ngrok-skip-browser-warning': '1',
-                },
-                body: systemBlob,
-                signal: abortController.signal,
-              });
-              if (res.ok) {
-                lastScreenOkRef.current = Date.now();
-                console.log(`[OS System Screen Sent] ${res.status} OK - ${systemBlob.size} bytes`);
-                setNetState((prev) => ({
-                  ...prev,
-                  status: 'ok',
-                  lastError: null,
-                  screenCount: prev.screenCount + 1,
-                }));
-              }
-            } catch (err: unknown) {
-              if (!abortController.signal.aborted) {
-                console.error('[OS System Screen Failed]', (err as Error)?.message);
-              }
-            } finally {
-              isSendingScreenRef.current = false;
-            }
-            return;
+          const st = await DC.getServiceStatus();
+          if (st) {
+            setNetState((prev) => ({
+              ...prev,
+              status: st.sseConnected || st.sent > 0 ? 'ok' : prev.status,
+              screenCount: typeof st.sent === 'number' ? st.sent : prev.screenCount,
+              uiActionCount: typeof st.actions === 'number' ? st.actions : prev.uiActionCount,
+            }));
           }
-        } catch {
-          // Fall back to standard capture
-        } finally {
-          capPendingRef.current--;
-        }
+        } catch {}
       }
-
-      const canvas = screenCanvasRef.current || document.createElement('canvas');
-      screenCanvasRef.current = canvas;
-
-      let captured = false;
-      const screenVideo = screenVideoRef.current;
-      if (screenStreamRef.current && screenVideo && screenVideo.readyState >= 2) {
-        canvas.width = screenVideo.videoWidth || window.innerWidth * (window.devicePixelRatio || 1);
-        canvas.height = screenVideo.videoHeight || window.innerHeight * (window.devicePixelRatio || 1);
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
-          captured = true;
-        }
-      }
-
-      if (!captured) {
-        captured = renderAppViewportToCanvas(canvas);
-      }
-
-      if (!captured) return;
-
-      isSendingScreenRef.current = true;
-      screenBusySinceRef.current = Date.now();
-      canvas.toBlob(
-        async (blob) => {
-          if (blob && !abortController.signal.aborted) {
-            const screenTarget = `${baseUrl}/v1/screen/sent`;
-            try {
-              const res = await postWithTimeout(screenTarget, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'image/webp',
-                  'ngrok-skip-browser-warning': '1',
-                },
-                body: blob,
-                signal: abortController.signal,
-              });
-              if (res.ok) {
-                lastScreenOkRef.current = Date.now();
-                console.log(
-                  `[Screen Sent] ${res.status} OK - ${blob.size} bytes (${canvas.width}x${canvas.height})`
-                );
-                setNetState((prev) => ({
-                  ...prev,
-                  status: 'ok',
-                  lastError: null,
-                  screenCount: prev.screenCount + 1,
-                }));
-              } else {
-                console.warn(`[Screen Sent Error] HTTP ${res.status}`);
-              }
-            } catch (err: unknown) {
-              if (!abortController.signal.aborted) {
-                console.error('[Screen Sent Failed]', (err as Error)?.message);
-              }
-            } finally {
-              isSendingScreenRef.current = false;
-            }
-          } else {
-            isSendingScreenRef.current = false;
-          }
-        },
-        'image/webp',
-        0.92
-      );
-    }, 1500);
-
-    // ---- Debug heartbeat: tells the PC whether the page is alive ----
-    const sendDbg = (ev: string) => {
-      try {
-        fetch(`${baseUrl}/v1/debug`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': '1' },
-          body: JSON.stringify({
-            ev,
-            vis: document.visibilityState,
-            sinceOkMs: Date.now() - lastScreenOkRef.current,
-            uploadBusy: isSendingScreenRef.current,
-            capPending: capPendingRef.current,
-            lastCapMs: lastCapMsRef.current,
-            online: navigator.onLine,
-          }),
-          signal: abortController.signal,
-        }).catch(() => {});
-      } catch {}
-    };
-    const dbgEvents = ['visibilitychange', 'freeze', 'resume', 'pagehide', 'pageshow', 'online', 'offline'];
-    const onDbgEvent = (e: Event) => sendDbg(`event:${e.type}`);
-    dbgEvents.forEach((n) => document.addEventListener(n, onDbgEvent));
-    window.addEventListener('online', onDbgEvent);
-    window.addEventListener('offline', onDbgEvent);
-    const dbgInterval = setInterval(() => sendDbg('hb'), 2000);
-    sendDbg('call-start');
+    }, 2000);
 
     // Start video & audio media streams
     const initMedia = async () => {
@@ -1732,12 +1586,8 @@ export default function App() {
     initMedia();
 
     return () => {
+      clearInterval(statsInterval);
       if (frameInterval) clearInterval(frameInterval);
-      if (screenInterval) clearInterval(screenInterval);
-      clearInterval(dbgInterval);
-      dbgEvents.forEach((n) => document.removeEventListener(n, onDbgEvent));
-      window.removeEventListener('online', onDbgEvent);
-      window.removeEventListener('offline', onDbgEvent);
       abortController.abort();
       stopVoiceRecording();
       stopAudioPlayer();
@@ -1750,19 +1600,17 @@ export default function App() {
       }
       setIsSharingDeviceScreen(false);
 
-      // Stop native Android foreground service
+      // Stop native Android streaming service
       const DeviceControl = (window as unknown as {
-        Capacitor?: { Plugins?: { DeviceControl?: { stopForegroundService?: () => Promise<any> } } };
+        Capacitor?: { Plugins?: { DeviceControl?: { stopService?: () => Promise<any> } } };
       }).Capacitor?.Plugins?.DeviceControl;
-      if (DeviceControl && typeof DeviceControl.stopForegroundService === 'function') {
-        DeviceControl.stopForegroundService().catch(() => {});
+      if (DeviceControl && typeof DeviceControl.stopService === 'function') {
+        DeviceControl.stopService().catch(() => {});
       }
     };
   }, [
     inCall,
     startAudioReceiver,
-    startScreenReceiver,
-    renderAppViewportToCanvas,
     stopAudioPlayer,
     stopVoiceRecording,
   ]);

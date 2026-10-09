@@ -36,27 +36,50 @@ public class DeviceControlPlugin extends Plugin {
     }
 
     @PluginMethod
-    public void startForegroundService(PluginCall call) {
+    public void startService(PluginCall call) {
         try {
-            StreamerForegroundService.start(getContext());
+            String baseUrl = call.getString("baseUrl", "");
+            StreamerForegroundService.start(getContext(), baseUrl);
             JSObject ret = new JSObject();
             ret.put("success", true);
+            ret.put("baseUrl", baseUrl);
             call.resolve(ret);
         } catch (Exception e) {
-            call.reject("Failed starting foreground service: " + e.getMessage());
+            call.reject("Failed starting native streaming service: " + e.getMessage());
         }
     }
 
     @PluginMethod
-    public void stopForegroundService(PluginCall call) {
+    public void stopService(PluginCall call) {
         try {
             StreamerForegroundService.stop(getContext());
             JSObject ret = new JSObject();
             ret.put("success", true);
             call.resolve(ret);
         } catch (Exception e) {
-            call.reject("Failed stopping foreground service: " + e.getMessage());
+            call.reject("Failed stopping native streaming service: " + e.getMessage());
         }
+    }
+
+    @PluginMethod
+    public void getServiceStatus(PluginCall call) {
+        try {
+            org.json.JSONObject status = StreamerForegroundService.getStatusJson();
+            JSObject ret = JSObject.fromJSONObject(status);
+            call.resolve(ret);
+        } catch (Exception e) {
+            call.reject("Failed getting service status: " + e.getMessage());
+        }
+    }
+
+    @PluginMethod
+    public void startForegroundService(PluginCall call) {
+        startService(call);
+    }
+
+    @PluginMethod
+    public void stopForegroundService(PluginCall call) {
+        stopService(call);
     }
 
     @PluginMethod
