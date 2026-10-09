@@ -1647,7 +1647,7 @@ export default function App() {
         <canvas ref={screenCanvasRef} className="hidden" />
         <video ref={screenVideoRef} autoPlay playsInline muted className="hidden" />
 
-        {/* Live camera stream */}
+        {/* Live camera stream or Idle Screen */}
         {inCall && cameraOn ? (
           <video
             ref={videoRef}
@@ -1663,7 +1663,16 @@ export default function App() {
             </svg>
             <span className="text-xs text-neutral-500 font-medium">Camera Off</span>
           </div>
-        ) : null}
+        ) : (
+          <div className="flex flex-col items-center justify-center text-neutral-600 gap-3 select-none">
+            <div className="w-16 h-16 rounded-full bg-neutral-900 border border-neutral-800 flex items-center justify-center shadow-inner">
+              <svg xmlns="http://www.w3.org/2000/svg" height="28px" viewBox="0 -960 960 960" width="28px" fill="#737373">
+                <path d="M480-480q33 0 56.5-23.5T560-560q0-33-23.5-56.5T480-640q-33 0-56.5 23.5T400-560q0 33 23.5 56.5T480-480Zm0 280q82 0 155-31.5t127.5-86Q815-372 847.5-445T880-600q0-83-32.5-156t-86-127Q708-936 635-968T480-1000q-83 0-156 32t-127 86q-54 54-85.5 127T80-600q0 82 32 155t86 127.5q54 54.5 127 86T480-200Z"/>
+              </svg>
+            </div>
+            <span className="text-xs text-neutral-400 font-medium tracking-wide">Minimal Streamer Ready</span>
+          </div>
+        )}
 
         {/* Small square settings button on top right */}
         <button
@@ -1984,11 +1993,23 @@ export default function App() {
                 stopVoiceRecording();
               }}
               onPointerCancel={(e) => {
+                // Do NOT immediately stop on cancel from WebView gesture recognition unless finger actually lifted
+                e.preventDefault();
+              }}
+              onTouchStart={(e) => {
+                e.stopPropagation();
+              }}
+              onTouchEnd={(e) => {
                 e.preventDefault();
                 stopVoiceRecording();
               }}
-              onContextMenu={(e) => e.preventDefault()}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                return false;
+              }}
               aria-label="Hold to record voice"
+              style={{ WebkitTouchCallout: 'none', userSelect: 'none', touchAction: 'none' }}
               className={`flex-1 h-14 sm:h-16 rounded-2xl sm:rounded-3xl transition-all duration-200 flex items-center justify-center gap-2 cursor-pointer border-none outline-none select-none touch-none ${
                 isRecordingVoice
                   ? 'bg-[#E53935] scale-[1.03] shadow-[0_12px_28px_rgba(229,57,53,0.55)] ring-4 ring-red-400/30'

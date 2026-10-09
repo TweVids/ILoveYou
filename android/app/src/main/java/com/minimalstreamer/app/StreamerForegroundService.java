@@ -170,6 +170,8 @@ public class StreamerForegroundService extends Service {
         }
     }
 
+    private volatile long uploadInFlightSince = 0;
+
     /**
      * Loop 1: Native screen capture and upload every ~1.5s
      */
@@ -178,10 +180,17 @@ public class StreamerForegroundService extends Service {
         while (!isStopped.get()) {
             long loopStart = System.currentTimeMillis();
 
+            // Watchdog: If an upload has been in-flight for > 4 seconds, release lock so capture loop never permanently stalls
+            if (isUploadInFlight.get() && (System.currentTimeMillis() - uploadInFlightSince > 4000)) {
+                Log.w(TAG, "[Watchdog] isUploadInFlight timed out (>4s), releasing lock to continue screen streaming");
+                isUploadInFlight.set(false);
+            }
+
             if (activeBaseUrl != null && !activeBaseUrl.isEmpty()) {
                 SystemActionService service = SystemActionService.getInstance();
                 if (service != null && !isUploadInFlight.get()) {
                     isUploadInFlight.set(true);
+                    uploadInFlightSince = System.currentTimeMillis();
                     service.takeSystemScreenshot(new SystemActionService.ScreenshotCallback() {
                         @Override
                         public void onSuccess(String base64, String mimeType) {
