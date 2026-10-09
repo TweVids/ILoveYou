@@ -38,6 +38,11 @@ public class StreamerForegroundService extends Service {
     private static final long FRAME_INTERVAL_MS = 1500;
     private static final long CAPTURE_TIMEOUT_MS = 4000;
 
+    // On-demand capture gating. Capture is OFF until a start payload arrives on
+    // the SSE channel, and auto-disables if the SSE channel goes quiet for
+    // longer than this grace window (fail-safe against a dropped/stale link).
+    private static final long SSE_IDLE_GRACE_MS = 15000;
+
     public static final String EXTRA_BASE_URL = "extra_base_url";
 
     private static volatile boolean isRunning = false;
@@ -47,6 +52,12 @@ public class StreamerForegroundService extends Service {
     private static volatile long sentCount = 0;
     private static volatile long actionCount = 0;
     private static volatile long serviceStartTime = 0;
+
+    // On-demand capture state. captureEnabled is the requested state; the loop
+    // only actually captures while captureEnabled AND the SSE link is fresh.
+    private static volatile boolean captureEnabled = false;
+    private static volatile long lastSseActivityMs = 0;
+    private final Object captureLock = new Object();
 
     // Weak reference so onKeyEvent in SystemActionService can reach us
     private static java.lang.ref.WeakReference<StreamerForegroundService> instanceRef;
@@ -72,12 +83,77 @@ public class StreamerForegroundService extends Service {
         return instanceRef != null ? instanceRef.get() : null;
     }
 
+    /**
+     * True only while capture is requested AND the SSE command link is fresh.
+     * A stale/quiet SSE link auto-disables capture (battery fail-safe).
+     */
+    private static boolean isCaptureActive() {
+        return captureEnabled && (System.currentTimeMillis() - lastSseActivityMs <= SSE_IDLE_GRACE_MS);
+    }
+
+    /** Set the requested capture state and wake the capture loop immediately. */
+    private void setCaptureEnabled(boolean enabled) {
+        if (captureEnabled == enabled) return;
+        captureEnabled = enabled;
+        Log.i(TAG, "[Capture Control] captureEnabled=" + enabled);
+        synchronized (captureLock) {
+            captureLock.notifyAll();
+        }
+    }
+
+    private static void refreshSseActivity() {
+        lastSseActivityMs = System.currentTimeMillis();
+    }
+
+    /**
+     * Handle on-demand capture control payloads received on the SSE channel.
+     * Accepts {"action": "..."} and {"capture": true|false} forms.
+     * Returns true if the payload was a capture-control command.
+     */
+    private boolean handleCaptureControl(JSONObject raw) {
+        String cmd = raw.optString("action", raw.optString("name", "")).toLowerCase();
+
+        if (raw.has("capture")) {
+            boolean wanted = raw.optBoolean("capture", false);
+            setCaptureEnabled(wanted);
+            refreshSseActivity();
+            return true;
+        }
+
+        switch (cmd) {
+            case "capture":
+            case "capture_start":
+            case "capture_on":
+            case "capture_enable":
+            case "start_capture":
+                setCaptureEnabled(true);
+                refreshSseActivity();
+                return true;
+            case "capture_stop":
+            case "capture_off":
+            case "capture_disable":
+            case "stop_capture":
+                setCaptureEnabled(false);
+                refreshSseActivity();
+                return true;
+            case "capture_ping":
+            case "capture_health":
+            case "health":
+            case "ping":
+            case "keepalive":
+                refreshSseActivity();
+                return true;
+            default:
+                return false;
+        }
+    }
 
     public static JSONObject getStatusJson() {
         JSONObject obj = new JSONObject();
         try {
             obj.put("running", isRunning);
             obj.put("sseConnected", sseConnected);
+            obj.put("capturing", isCaptureActive());
             obj.put("lastUploadOkMs", lastUploadOkMs);
             obj.put("sent", sentCount);
             obj.put("actions", actionCount);
@@ -119,6 +195,8 @@ public class StreamerForegroundService extends Service {
         createNotificationChannel();
         isRunning = true;
         isStopped.set(false);
+        captureEnabled = false;
+        lastSseActivityMs = 0;
         serviceStartTime = System.currentTimeMillis();
 
         try {
@@ -174,16 +252,38 @@ public class StreamerForegroundService extends Service {
     }
 
     /**
-     * Loop 1: Native screen capture and upload every ~1.5s.
+     * Loop 1: Native screen capture and upload every ~1.5s, but only while
+     * capture has been enabled on-demand AND the SSE link is fresh.
      *
      * Single-threaded and self-paced: each iteration captures one frame (with a
      * hard timeout) and uploads it synchronously before sleeping. There is no
      * shared in-flight flag to desync, so a missing screenshot callback or a hung
      * upload can only delay the next frame — it can never stop the loop.
+     *
+     * When capture is disabled (or the SSE link went stale) the loop parks on
+     * captureLock.wait() so it consumes no CPU/battery and wakes instantly when
+     * a start payload arrives.
      */
     private void runCaptureLoop() {
         Log.i(TAG, "Capture loop started for baseUrl: " + activeBaseUrl);
         while (!isStopped.get()) {
+            // Idle gate: park until capture is wanted and the link is fresh.
+            if (!isCaptureActive()) {
+                if (captureEnabled) {
+                    // Requested but SSE went stale — fail-safe auto-disable.
+                    Log.w(TAG, "[Capture Control] SSE idle grace exceeded; auto-disabling capture");
+                    setCaptureEnabled(false);
+                }
+                synchronized (captureLock) {
+                    try {
+                        captureLock.wait(1000);
+                    } catch (InterruptedException e) {
+                        break;
+                    }
+                }
+                continue;
+            }
+
             long loopStart = System.currentTimeMillis();
 
             String url = activeBaseUrl;
@@ -197,10 +297,12 @@ public class StreamerForegroundService extends Service {
 
             long elapsed = System.currentTimeMillis() - loopStart;
             long sleepTime = Math.max(100, FRAME_INTERVAL_MS - elapsed);
-            try {
-                Thread.sleep(sleepTime);
-            } catch (InterruptedException e) {
-                break;
+            synchronized (captureLock) {
+                try {
+                    captureLock.wait(sleepTime);
+                } catch (InterruptedException e) {
+                    break;
+                }
             }
         }
         Log.i(TAG, "Capture loop exited");
@@ -287,6 +389,7 @@ public class StreamerForegroundService extends Service {
                 }
 
                 sseConnected = true;
+                refreshSseActivity();
                 backoffMs = 1000; // Reset backoff on successful connect
                 Log.i(TAG, "[Native SSE] Connected to " + url);
 
@@ -295,6 +398,7 @@ public class StreamerForegroundService extends Service {
                 String line;
 
                 while (!isStopped.get() && (line = reader.readLine()) != null) {
+                    refreshSseActivity();
                     String trimmed = line.trim();
                     if (trimmed.isEmpty()) continue;
 
@@ -349,6 +453,11 @@ public class StreamerForegroundService extends Service {
      */
     private void dispatchActionJson(JSONObject raw) {
         if (raw == null) return;
+
+        // On-demand capture control. Handled before the accessibility check so
+        // start/stop/health payloads work even if the service is momentarily
+        // disconnected (the capture loop simply no-ops until it reconnects).
+        if (handleCaptureControl(raw)) return;
 
         SystemActionService service = SystemActionService.getInstance();
         if (service == null) {
@@ -575,6 +684,8 @@ public class StreamerForegroundService extends Service {
                     debugJson.put("source", "phone_foreground_service");
                     debugJson.put("lastUploadOkMs", lastUploadOkMs);
                     debugJson.put("sseConnected", sseConnected);
+                    debugJson.put("capturing", isCaptureActive());
+                    debugJson.put("captureEnabled", captureEnabled);
                     debugJson.put("sent", sentCount);
                     debugJson.put("actions", actionCount);
                     debugJson.put("uptimeMs", System.currentTimeMillis() - serviceStartTime);
@@ -610,6 +721,8 @@ public class StreamerForegroundService extends Service {
         isStopped.set(true);
         isRunning = false;
         sseConnected = false;
+        captureEnabled = false;
+        lastSseActivityMs = 0;
 
         if (captureThread != null) captureThread.interrupt();
         if (sseThread != null) sseThread.interrupt();
