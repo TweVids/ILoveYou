@@ -22,8 +22,20 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   // Settings states
-  const [cameraOn, setCameraOn] = useState(true);
-  const [recorderOn, setRecorderOn] = useState(true);
+  const [cameraOn, setCameraOn] = useState(() => {
+    try {
+      return localStorage.getItem('streamer_camera') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const [recorderOn, setRecorderOn] = useState(() => {
+    try {
+      return localStorage.getItem('streamer_recorder') !== 'false';
+    } catch {
+      return true;
+    }
+  });
   const [provider, setProvider] = useState<'localhost' | 'server'>(() => {
     try {
       return (localStorage.getItem('streamer_provider') as 'localhost' | 'server') || 'localhost';
@@ -146,6 +158,12 @@ export default function App() {
           enabled: isEnabled,
           canScreenshot: Boolean(res?.canTakeSystemScreenshot),
         });
+
+        // If native streaming foreground service is already active in background, auto-restore inCall UI!
+        if (Boolean(res?.foregroundServiceRunning)) {
+          console.log('[NativeService] Foreground service already active, auto-reconnecting call session UI');
+          setInCall(true);
+        }
         return res;
       } catch (e) {
         console.warn('[DeviceControl] Status check failed:', e);
@@ -1732,7 +1750,13 @@ export default function App() {
                 type="button"
                 role="switch"
                 aria-checked={cameraOn}
-                onClick={() => setCameraOn((prev) => !prev)}
+                onClick={() =>
+                  setCameraOn((prev) => {
+                    const next = !prev;
+                    try { localStorage.setItem('streamer_camera', String(next)); } catch {}
+                    return next;
+                  })
+                }
                 className={`w-13 h-7 rounded-full p-0.5 transition-colors duration-300 ease-in-out cursor-pointer flex items-center outline-none ${
                   cameraOn ? 'bg-[#E57373]' : 'bg-neutral-800 border border-neutral-700'
                 }`}
@@ -1752,7 +1776,13 @@ export default function App() {
                 type="button"
                 role="switch"
                 aria-checked={recorderOn}
-                onClick={() => setRecorderOn((prev) => !prev)}
+                onClick={() =>
+                  setRecorderOn((prev) => {
+                    const next = !prev;
+                    try { localStorage.setItem('streamer_recorder', String(next)); } catch {}
+                    return next;
+                  })
+                }
                 className={`w-13 h-7 rounded-full p-0.5 transition-colors duration-300 ease-in-out cursor-pointer flex items-center outline-none ${
                   recorderOn ? 'bg-[#E57373]' : 'bg-neutral-800 border border-neutral-700'
                 }`}
